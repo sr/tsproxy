@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"sr/cmd/tsproxy/internal/autocert/internal/acmetest"
+	"github.com/sr/tsproxy/internal/autocert/internal/acmetest"
 
 	"golang.org/x/crypto/acme"
 )
