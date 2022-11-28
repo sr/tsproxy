@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 
 	"golang.org/x/exp/slog"
 	"tailscale.com/client/tailscale/apitype"
@@ -46,6 +47,7 @@ func tsSingleHostReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url 
 }
 
 func tsReverseProxy(rpx map[string]http.Handler, metrics http.Handler, targets []string, self string) http.Handler {
+	sort.Strings(targets)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)

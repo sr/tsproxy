@@ -251,7 +251,7 @@ func tsproxy(ctx context.Context) error {
 			// SingleHostReverseProxy for each upstream.
 			rpx = make(map[string]http.Handler)
 
-			// targets returned by http_sd discovery endpoint.
+			// targets returned by the http_sd discovery endpoint.
 			targets []string
 		)
 		for _, u := range ups {

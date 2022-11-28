@@ -145,9 +145,9 @@ func TestNewTSProxyHandler(t *testing.T) {
 		},
 		{
 			name: "self service discovery",
-			h:    tsReverseProxy(nil, nil, []string{"localhost:8000"}, "example.com"),
+			h:    tsReverseProxy(nil, nil, []string{"zzz:80", "localhost:8000"}, "example.com"),
 			req:  &http.Request{RequestURI: "/sd", TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{`application/json; charset=utf-8`}}, Body: io.NopCloser(bytes.NewReader([]byte(`[{"targets":["localhost:8000"]}]`)))},
+			want: &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{`application/json; charset=utf-8`}}, Body: io.NopCloser(bytes.NewReader([]byte(`[{"targets":["localhost:8000","zzz:80"]}]`)))},
 		},
 	} {
 		tc := tc
