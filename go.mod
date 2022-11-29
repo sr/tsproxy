@@ -13,7 +13,7 @@ require (
 	golang.org/x/net v0.0.0-20221002022538-bcab6841153b
 	golang.org/x/oauth2 v0.0.0-20220223155221-ee480838109b
 	golang.org/x/sync v0.0.0-20220601150217-0de741cfad7f
-	tailscale.com v1.32.2
+	tailscale.com v1.32.3
 )
 
 require (
