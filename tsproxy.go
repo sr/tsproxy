@@ -4,20 +4,57 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"html/template"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
+	"strings"
+	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"golang.org/x/exp/slog"
+	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
 )
 
 type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
 }
 
-func tsSingleHostReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.Handler {
+func tsWaitStatusReady(ctx context.Context, lc *tailscale.LocalClient) (*ipnstate.Status, error) {
+	var st *ipnstate.Status
+
+	err := backoff.Retry(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		loopCtx, cancel := context.WithTimeout(ctx, time.Second)
+		var err error
+		st, err = lc.Status(loopCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("get status: %w", err)
+		}
+
+		if st.BackendState != "Running" {
+			return fmt.Errorf("backend not running: %s", st.BackendState)
+		}
+		if len(st.TailscaleIPs) != 2 {
+			return fmt.Errorf("IPs not yet assigned")
+		}
+		return nil
+	}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {
 	// TODO(sr) Instrument proxy.Transport
 	proxy := httputil.NewSingleHostReverseProxy(url)
 	orig := proxy.Director
@@ -29,6 +66,7 @@ func tsSingleHostReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url 
 			logger.Error("tailscale whois", err)
 			return
 		}
+		// TODO(sr) No tags?
 		if whois.UserProfile == nil {
 			logger.Error("tailscale whois", errors.New("response did not include a user profile"))
 			return
@@ -46,41 +84,51 @@ func tsSingleHostReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url 
 	})
 }
 
-func tsReverseProxy(rpx map[string]http.Handler, metrics http.Handler, targets []string, self string) http.Handler {
-	sort.Strings(targets)
+func serveDiscovery(self string, targets []target) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		if r.TLS.ServerName == self {
-			if r.RequestURI == "/sd" {
-				resp := []struct {
-					Targets []string `json:"targets"`
-				}{
-					{Targets: targets},
-				}
-				buf, err := json.Marshal(resp)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-					return
-				}
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				_, _ = w.Write(buf)
-				return
+		var tgs []string
+		tgs = append(tgs, self)
+		for _, t := range targets {
+			if t.magicDNS == "" {
+				continue
 			}
-			if r.RequestURI == "/metrics" {
-				metrics.ServeHTTP(w, r)
-				return
+			if !t.prometheus {
+				continue
 			}
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+			tgs = append(tgs, t.magicDNS)
+		}
+		sort.Strings(tgs)
+		buf, err := json.Marshal([]struct {
+			Targets []string `json:"targets"`
+		}{
+			{Targets: tgs},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		px, ok := rpx[r.TLS.ServerName]
-		if !ok {
-			http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write(buf)
+	})
+}
+
+func serveIndex(t *template.Template, targets []target) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var tgs []string
+		for _, t := range targets {
+			if t.magicDNS == "" {
+				continue
+			}
+			h, _, ok := strings.Cut(t.magicDNS, ".") // strip the magicDNS suffix.
+			if !ok {
+				continue
+			}
+			tgs = append(tgs, h)
+		}
+		sort.Strings(tgs)
+		if err := t.Execute(w, tgs); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		px.ServeHTTP(w, r)
 	})
 }

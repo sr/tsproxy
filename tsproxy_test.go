@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -29,7 +29,64 @@ func (c *fakeLocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apityp
 	return c.whois(ctx, remoteAddr)
 }
 
-func TestNewReverseProxy(t *testing.T) {
+func TestParseUpstream(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		upstream string
+		want     upstream
+		err      error
+	}{
+		{
+			upstream: "test=http://example.com:-80/",
+			want:     upstream{},
+			err:      errors.New(`parse "http://`),
+		},
+		{
+			upstream: "test=http://localhost",
+			want:     upstream{name: "test", backend: mustParseURL("http://localhost")},
+		},
+		{
+			upstream: "test=http://localhost;prometheus",
+			want:     upstream{name: "test", backend: mustParseURL("http://localhost"), prometheus: true},
+		},
+		{
+			upstream: "test=http://localhost;foo",
+			want:     upstream{},
+			err:      errors.New("unsupported option: foo"),
+		},
+	} {
+		tc := tc
+		t.Run(tc.upstream, func(t *testing.T) {
+			t.Parallel()
+			up, err := parseUpstreamFlag(tc.upstream)
+			if tc.err != nil {
+				if err == nil {
+					t.Fatalf("want err %v, got nil", tc.err)
+				}
+				if !strings.Contains(err.Error(), tc.err.Error()) {
+					t.Fatalf("want err %v, got %v", tc.err, err)
+				}
+			}
+			if tc.err == nil && err != nil {
+				t.Fatalf("want no err, got %v", err)
+			}
+			if diff := cmp.Diff(tc.want, up, cmp.Exporter(func(_ reflect.Type) bool { return true })); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func mustParseURL(s string) *url.URL {
+	v, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func TestReverseProxy(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -79,7 +136,7 @@ func TestNewReverseProxy(t *testing.T) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			px := httptest.NewServer(tsSingleHostReverseProxy(slog.New(slog.NewTextHandler(io.Discard)), lc, beURL))
+			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard)), lc, beURL))
 			defer px.Close()
 
 			resp, err := http.Get(px.URL)
@@ -104,94 +161,53 @@ func TestNewReverseProxy(t *testing.T) {
 	}
 }
 
-func TestNewTSProxyHandler(t *testing.T) {
+func TestServeDiscovery(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		name string
-		h    http.Handler
-		req  *http.Request
-		want *http.Response
-	}{
-		{
-			name: "no tls",
-			h:    tsReverseProxy(nil, nil, nil, ""),
-			req:  &http.Request{},
-			want: &http.Response{StatusCode: http.StatusInternalServerError},
-		},
-		{
-			name: "upstream not found",
-			h:    tsReverseProxy(nil, nil, nil, ""),
-			req:  &http.Request{TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusNotFound},
-		},
-		{
-			name: "upstream found",
-			h:    tsReverseProxy(map[string]http.Handler{"example.com": http.RedirectHandler("http://redirect.net", http.StatusMovedPermanently)}, nil, nil, ""),
-			req:  &http.Request{TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{"Location": []string{"http://redirect.net"}}},
-		},
-		{
-			name: "self not found",
-			h:    tsReverseProxy(map[string]http.Handler{"example.com": http.RedirectHandler("http://redirect.net", http.StatusMovedPermanently)}, nil, nil, "example.com"),
-			req:  &http.Request{RequestURI: "/", TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusNotFound},
-		},
-		{
-			name: "self metrics",
-			h:    tsReverseProxy(nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintf(w, "metrics") }), nil, "example.com"),
-			req:  &http.Request{RequestURI: "/metrics", TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte("metrics")))},
-		},
-		{
-			name: "self service discovery",
-			h:    tsReverseProxy(nil, nil, []string{"zzz:80", "localhost:8000"}, "example.com"),
-			req:  &http.Request{RequestURI: "/sd", TLS: &tls.ConnectionState{ServerName: "example.com"}},
-			want: &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{`application/json; charset=utf-8`}}, Body: io.NopCloser(bytes.NewReader([]byte(`[{"targets":["localhost:8000","zzz:80"]}]`)))},
-		},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			r := httptest.NewRecorder()
-			tc.h.ServeHTTP(r, tc.req)
-			resp := r.Result()
-			if want, got := tc.want.StatusCode, resp.StatusCode; want != got {
-				t.Errorf("want status %d, got: %d", want, got)
-			}
-			if len(tc.want.Header) > 0 {
-				if diff := cmp.Diff(tc.want.Header, resp.Header); diff != "" {
-					t.Errorf("headers mismatch (-want +got):\n%s", diff)
-				}
-			}
-			if tc.want.Body != nil {
-				want, err := io.ReadAll(tc.want.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := io.ReadAll(resp.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if diff := cmp.Diff(string(want), string(got)); diff != "" {
-					t.Errorf("body mismatch (-want +got):\n%s", diff)
-				}
-			}
-		})
+	ts := httptest.NewServer(serveDiscovery("self", []target{
+		{magicDNS: "b", prometheus: true},
+		{magicDNS: "x"},
+		{},
+		{magicDNS: "a", prometheus: true},
+	}))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if want, got := http.StatusOK, resp.StatusCode; want != got {
+		t.Errorf("want status %d, got: %d", want, got)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(`[{"targets":["a","b","self"]}]`, string(b)); diff != "" {
+		t.Errorf("body mismatch (-want +got):\n%s", diff)
 	}
 }
 
 func TestMetrics(t *testing.T) {
 	t.Parallel()
 
+	c, err := testutil.GatherAndCount(prometheus.DefaultGatherer)
+	if err != nil {
+		t.Fatalf("GatherAndCount: %v", err)
+	}
+	if c == 0 {
+		t.Fatalf("no metrics collected")
+	}
+
 	lint, err := testutil.GatherAndLint(prometheus.DefaultGatherer)
 	if err != nil {
 		t.Fatalf("CollectAndLint: %v", err)
 	}
+	if len(lint) > 0 {
+		t.Error("lint problems detected")
+	}
 	for _, prob := range lint {
 		t.Errorf("lint: %s: %s", prob.Metric, prob.Text)
-	}
-	if len(lint) > 0 {
-		t.Fatal("lint problems detected")
 	}
 }
