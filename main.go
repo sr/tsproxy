@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,11 +24,6 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
-)
-
-const (
-	// keep this below systemd's DefaultTimeoutStopSec (90 seconds)
-	stopTimeout = 80 * time.Second
 )
 
 var (
@@ -120,7 +115,7 @@ func tsproxy(ctx context.Context) error {
 	var (
 		state = flag.String("state", "", "Optional directory for storing Tailscale state.")
 		tslog = flag.Bool("tslog", false, "If true, log Tailscale output.")
-		port  = flag.Int("port", 32019, "Port of the proxy's own HTTP server.")
+		port  = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
 	)
 	var upstreams upstreamFlag
 	flag.Var(&upstreams, "upstream", "Repeated for each upstream. Format: name=http://backend:8000")
@@ -142,6 +137,8 @@ func tsproxy(ctx context.Context) error {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr))
+	// see ReverseProxy.ErrorLog; this ensures these logs go to our logger.
+	slog.SetDefault(logger)
 
 	st, err := tsWaitStatusReady(ctx, &tailscale.LocalClient{})
 	if err != nil {
@@ -201,17 +198,19 @@ func tsproxy(ctx context.Context) error {
 	for i, upstream := range upstreams {
 		// https://go.dev/doc/faq#closures_and_goroutines
 		i := i
-		up := upstream
+		upstream := upstream
 
-		log := logger.With(slog.String("upstream", up.name))
+		log := logger.With(slog.String("upstream", upstream.name))
 
 		ts := &tsnet.Server{
-			Hostname: up.name,
-			Dir:      filepath.Join(*state, "tailscale-"+up.name),
+			Hostname: upstream.name,
+			Dir:      filepath.Join(*state, "tailscale-"+upstream.name),
 		}
+		defer ts.Close()
+
 		if *tslog {
 			ts.Logf = func(format string, args ...any) {
-				log.LogAttrs(slog.InfoLevel, fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
+				log.Info(fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
 			}
 		} else {
 			ts.Logf = tslogger.Discard
@@ -222,46 +221,51 @@ func tsproxy(ctx context.Context) error {
 
 		lc, err := ts.LocalClient()
 		if err != nil {
-			return fmt.Errorf("tailscale: get local client for %s: %w", up.name, err)
+			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.name, err)
 		}
 
 		srv := &http.Server{
+			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
 			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight,
 				promhttp.InstrumentHandlerDuration(duration,
 					promhttp.InstrumentHandlerCounter(requests,
-						newReverseProxy(log, lc, up.backend)))),
+						newReverseProxy(log, lc, upstream.backend)))),
 		}
 
 		g.Add(func() error {
-			defer ts.Close()
-
-			ln, err := ts.Listen("tcp", ":80")
-			if err != nil {
-				return fmt.Errorf("tailscale: listen for %s on port 80: %w", up.name, err)
-			}
-			defer ln.Close()
-
 			st, err := tsWaitStatusReady(ctx, lc)
 			if err != nil {
-				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", up.name, err)
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}
 
 			// register in service discovery when we're ready.
-			targets[i] = target{name: up.name, prometheus: up.prometheus, magicDNS: st.Self.DNSName}
+			targets[i] = target{name: upstream.name, prometheus: upstream.prometheus, magicDNS: st.Self.DNSName}
 
-			log.Info("server ready", slog.String("addr", ln.Addr().String()))
-
+			ln, err := ts.Listen("tcp", ":80")
+			if err != nil {
+				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.name, err)
+			}
 			return srv.Serve(ln)
 		}, func(err error) {
-			log.Info("shutting down server")
-
-			sctx, sc := context.WithTimeout(ctx, stopTimeout)
-			defer sc()
-			if err := srv.Shutdown(sctx); err != nil && err != http.ErrServerClosed {
+			if err := srv.Close(); err != nil {
 				log.Error("server shutdown", err)
 			}
 		})
-
+		g.Add(func() error {
+			_, err := tsWaitStatusReady(ctx, lc)
+			if err != nil {
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
+			}
+			ln, err := ts.Listen("tcp", ":443")
+			if err != nil {
+				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
+			}
+			return srv.ServeTLS(ln, "", "")
+		}, func(err error) {
+			if err := srv.Close(); err != nil {
+				log.Error("TLS server shutdown", err)
+			}
+		})
 	}
 
 	return g.Run()
