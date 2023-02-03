@@ -100,24 +100,24 @@ func TestReverseProxy(t *testing.T) {
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return nil, errors.New("whois error")
 			},
-			want: http.StatusForbidden,
+			want: http.StatusInternalServerError,
 		},
 		{
 			name: "tailscale whois no profile",
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{}, nil
 			},
-			want: http.StatusForbidden,
+			want: http.StatusInternalServerError,
 		},
 		{
 			name: "tailscale whois ok",
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
-				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "user", DisplayName: "user"}}, nil
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}}, nil
 			},
 			want: http.StatusOK,
 			wantHeaders: map[string]string{
-				"X-Webauth-User": "user",
-				"X-Webauth-Name": "user",
+				"X-Webauth-User": "login",
+				"X-Webauth-Name": "name",
 			},
 		},
 	} {

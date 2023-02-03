@@ -56,31 +56,34 @@ func tsWaitStatusReady(ctx context.Context, lc *tailscale.LocalClient) (*ipnstat
 
 func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {
 	// TODO(sr) Instrument proxy.Transport
-	proxy := httputil.NewSingleHostReverseProxy(url)
-	orig := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		orig(req)
+	rproxy := &httputil.ReverseProxy{
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(url)
+			req.SetXForwarded()
+			req.Out.Host = req.In.Host
+		},
+	}
 
-		whois, err := lc.WhoIs(req.Context(), req.RemoteAddr)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		whois, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			logger.Error("tailscale whois", err)
 			return
 		}
-		// TODO(sr) No tags?
+
+		// TODO(sr) Forbid access to tagged users (i.e. machines)?
 		if whois.UserProfile == nil {
-			logger.Error("tailscale whois", errors.New("response did not include a user profile"))
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.Error("tailscale whois", errors.New("user profile missing"))
 			return
 		}
+
+		req := r.Clone(r.Context())
 		req.Header.Set("X-Webauth-User", whois.UserProfile.LoginName)
 		req.Header.Set("X-Webauth-Name", whois.UserProfile.DisplayName)
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxy.Director(r)
-		if r.Header.Get("X-Webauth-User") == "" || r.Header.Get("X-Webauth-Name") == "" {
-			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-			return
-		}
-		proxy.ServeHTTP(w, r)
+
+		rproxy.ServeHTTP(w, req)
 	})
 }
 
