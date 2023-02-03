@@ -61,6 +61,10 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 			req.Out.Host = req.In.Host
 		},
 	}
+	rproxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
+		logger.Error("upstream error", err)
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := lc.WhoIs(r.Context(), r.RemoteAddr)

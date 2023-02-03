@@ -136,7 +136,6 @@ func tsproxy(ctx context.Context) error {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr))
-	// see ReverseProxy.ErrorLog; this ensures these logs go to our logger.
 	slog.SetDefault(logger)
 
 	st, err := tsWaitStatusReady(ctx, &tailscale.LocalClient{})
@@ -223,7 +222,7 @@ func tsproxy(ctx context.Context) error {
 			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight,
 				promhttp.InstrumentHandlerDuration(duration,
 					promhttp.InstrumentHandlerCounter(requests,
-						newReverseProxy(log, lc, upstream.backend)))),
+						newReverseProxy(log.With(slog.String("upstream", upstream.name)), lc, upstream.backend)))),
 		}
 
 		g.Add(func() error {
