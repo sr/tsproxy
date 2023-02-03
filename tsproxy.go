@@ -8,38 +8,13 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sort"
-	"time"
 
 	"golang.org/x/exp/slog"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/ipn/ipnstate"
 )
 
 type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
-}
-
-func tsWaitStatusReady(ctx context.Context, logger *slog.Logger, lc *tailscale.LocalClient) (*ipnstate.Status, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		loopCtx, cancel := context.WithTimeout(ctx, time.Second)
-		st, err := lc.Status(loopCtx)
-		cancel()
-		if err != nil {
-			logger.Error("get tailscale status", err)
-			continue
-		}
-
-		if st.BackendState == "Running" && len(st.TailscaleIPs) == 2 {
-			return st, nil
-		}
-		logger.Info("waiting for tailscale backend to be ready", slog.String("state", st.BackendState), slog.Int("IPs", len(st.TailscaleIPs)), slog.String("authURL", st.AuthURL))
-		time.Sleep(time.Second)
-	}
 }
 
 func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {

@@ -141,9 +141,10 @@ func tsproxy(ctx context.Context) error {
 	logger := slog.New((slog.HandlerOptions{}).NewJSONHandler(os.Stderr))
 	slog.SetDefault(logger)
 
-	st, err := tsWaitStatusReady(ctx, logger, &tailscale.LocalClient{})
+	// If tailscaled isn't ready yet, just crash.
+	st, err := (&tailscale.LocalClient{}).Status(ctx)
 	if err != nil {
-		return fmt.Errorf("tailscale: wait for node to be ready: %w", err)
+		return fmt.Errorf("tailscale: get node status: %w", err)
 	}
 
 	// service discovery targets (self + all upstreams)
@@ -232,7 +233,7 @@ func tsproxy(ctx context.Context) error {
 		}
 
 		g.Add(func() error {
-			st, err := tsWaitStatusReady(ctx, log, lc)
+			st, err := ts.Up(ctx)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}
@@ -252,7 +253,7 @@ func tsproxy(ctx context.Context) error {
 			cancel()
 		})
 		g.Add(func() error {
-			_, err := tsWaitStatusReady(ctx, log, lc)
+			_, err := ts.Up(ctx)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}
