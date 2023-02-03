@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"html/template"
 	"net"
 	"net/http"
 	"net/url"
@@ -154,20 +153,6 @@ func tsproxy(ctx context.Context) error {
 	g.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
 
 	{
-		t, err := template.New("index.html").Parse(`<html>
-				<head><title>tsproxy</title></head>
-				<body>
-				<h1>tsproxy</h1>
-				<p><a href="/metrics">Metrics</a></p>
-				<p><a href="/sd">Discovery</a></p>
-				<h2>Upstreams:</h2>
-				<ul>{{ range .}}<li><a href="//{{ . }}">{{ . }}</a></li>{{end}}</ul>
-				</body>
-				</html>`)
-		if err != nil {
-			return err
-		}
-
 		ln, err := net.Listen("tcp", net.JoinHostPort(st.Self.TailscaleIPs[0].String(), strconv.Itoa(*port)))
 		if err != nil {
 			return fmt.Errorf("listen on %d: %w", *port, err)
@@ -181,7 +166,16 @@ func tsproxy(ctx context.Context) error {
 
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
-		http.Handle("/", serveIndex(t, targets))
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`<html>
+				<head><title>tsproxy</title></head>
+				<body>
+				<h1>tsproxy</h1>
+				<p><a href="/metrics">Metrics</a></p>
+				<p><a href="/sd">Discovery</a></p>
+				</body>
+				</html>`))
+		})
 
 		srv := &http.Server{}
 		g.Add(func() error {

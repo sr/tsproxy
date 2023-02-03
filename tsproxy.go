@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -112,26 +110,5 @@ func serveDiscovery(self string, targets []target) http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = w.Write(buf)
-	})
-}
-
-func serveIndex(t *template.Template, targets []target) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var tgs []string
-		for _, t := range targets {
-			if t.magicDNS == "" {
-				continue
-			}
-			h, _, ok := strings.Cut(t.magicDNS, ".") // strip the magicDNS suffix.
-			if !ok {
-				continue
-			}
-			tgs = append(tgs, h)
-		}
-		sort.Strings(tgs)
-		if err := t.Execute(w, tgs); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 	})
 }
