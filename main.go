@@ -26,11 +26,14 @@ import (
 )
 
 var (
-	requestsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "tsproxy",
-		Name:      "requests_in_flight",
-		Help:      "Number of requests currently being served by the server.",
-	})
+	requestsInFlight = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "tsproxy",
+			Name:      "requests_in_flight",
+			Help:      "Number of requests currently being served by the server.",
+		},
+		[]string{"upstream"},
+	)
 
 	requests = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -38,7 +41,7 @@ var (
 			Name:      "requests_total",
 			Help:      "Number of requests received by the server.",
 		},
-		[]string{"code", "method"},
+		[]string{"upstream", "code", "method"},
 	)
 
 	duration = promauto.NewHistogramVec(
@@ -48,7 +51,7 @@ var (
 			Help:                        "A histogram of latencies for requests handled by the server.",
 			NativeHistogramBucketFactor: 1.1,
 		},
-		[]string{"code", "method"},
+		[]string{"upstream", "code", "method"},
 	)
 )
 
@@ -152,16 +155,12 @@ func tsproxy(ctx context.Context) error {
 	g.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
 
 	{
-		ln, err := net.Listen("tcp", net.JoinHostPort(st.Self.TailscaleIPs[0].String(), strconv.Itoa(*port)))
+		p := strconv.Itoa(*port)
+		ln, err := net.Listen("tcp", net.JoinHostPort(st.Self.TailscaleIPs[0].String(), p))
 		if err != nil {
 			return fmt.Errorf("listen on %d: %w", *port, err)
 		}
 		defer ln.Close()
-
-		_, p, err := net.SplitHostPort(ln.Addr().String())
-		if err != nil {
-			return err
-		}
 
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
@@ -219,9 +218,9 @@ func tsproxy(ctx context.Context) error {
 
 		srv := &http.Server{
 			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight,
-				promhttp.InstrumentHandlerDuration(duration,
-					promhttp.InstrumentHandlerCounter(requests,
+			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.name}),
+				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
+					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
 						newReverseProxy(log.With(slog.String("upstream", upstream.name)), lc, upstream.backend)))),
 		}
 
