@@ -138,10 +138,10 @@ func tsproxy(ctx context.Context) error {
 		state = &dir
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr))
+	logger := slog.New((slog.HandlerOptions{}).NewJSONHandler(os.Stderr))
 	slog.SetDefault(logger)
 
-	st, err := tsWaitStatusReady(ctx, &tailscale.LocalClient{})
+	st, err := tsWaitStatusReady(ctx, logger, &tailscale.LocalClient{})
 	if err != nil {
 		return fmt.Errorf("tailscale: wait for node to be ready: %w", err)
 	}
@@ -225,7 +225,7 @@ func tsproxy(ctx context.Context) error {
 		}
 
 		g.Add(func() error {
-			st, err := tsWaitStatusReady(ctx, lc)
+			st, err := tsWaitStatusReady(ctx, log, lc)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}
@@ -244,7 +244,7 @@ func tsproxy(ctx context.Context) error {
 			}
 		})
 		g.Add(func() error {
-			_, err := tsWaitStatusReady(ctx, lc)
+			_, err := tsWaitStatusReady(ctx, log, lc)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}

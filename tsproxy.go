@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"golang.org/x/exp/slog"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
@@ -22,34 +20,26 @@ type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
 }
 
-func tsWaitStatusReady(ctx context.Context, lc *tailscale.LocalClient) (*ipnstate.Status, error) {
-	var st *ipnstate.Status
-
-	err := backoff.Retry(func() error {
+func tsWaitStatusReady(ctx context.Context, logger *slog.Logger, lc *tailscale.LocalClient) (*ipnstate.Status, error) {
+	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 
 		loopCtx, cancel := context.WithTimeout(ctx, time.Second)
-		var err error
-		st, err = lc.Status(loopCtx)
+		st, err := lc.Status(loopCtx)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("get status: %w", err)
+			logger.Error("get tailscale status", err)
+			continue
 		}
 
-		if st.BackendState != "Running" {
-			return fmt.Errorf("backend not running: %s", st.BackendState)
+		if st.BackendState == "Running" && len(st.TailscaleIPs) == 2 {
+			return st, nil
 		}
-		if len(st.TailscaleIPs) != 2 {
-			return fmt.Errorf("IPs not yet assigned")
-		}
-		return nil
-	}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
-	if err != nil {
-		return nil, err
+		logger.Info("waiting for tailscale backend to be ready", slog.String("state", st.BackendState), slog.Int("IPs", len(st.TailscaleIPs)), slog.String("authURL", st.AuthURL))
+		time.Sleep(time.Second)
 	}
-	return st, nil
 }
 
 func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {
