@@ -249,6 +249,7 @@ func tsproxy(ctx context.Context) error {
 			if err := srv.Close(); err != nil {
 				log.Error("server shutdown", err)
 			}
+			cancel()
 		})
 		g.Add(func() error {
 			_, err := tsWaitStatusReady(ctx, log, lc)
@@ -264,6 +265,7 @@ func tsproxy(ctx context.Context) error {
 			if err := srv.Close(); err != nil {
 				log.Error("TLS server shutdown", err)
 			}
+			cancel()
 		})
 	}
 
