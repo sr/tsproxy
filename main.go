@@ -156,11 +156,15 @@ func tsproxy(ctx context.Context) error {
 
 	{
 		p := strconv.Itoa(*port)
-		ln, err := net.Listen("tcp", net.JoinHostPort(st.Self.TailscaleIPs[0].String(), p))
-		if err != nil {
-			return fmt.Errorf("listen on %d: %w", *port, err)
+
+		var listeners []net.Listener
+		for _, ip := range st.Self.TailscaleIPs {
+			ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
+			if err != nil {
+				return fmt.Errorf("listen on %s:%d: %w", ip, *port, err)
+			}
+			listeners = append(listeners, ln)
 		}
-		defer ln.Close()
 
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
@@ -176,15 +180,18 @@ func tsproxy(ctx context.Context) error {
 		})
 
 		srv := &http.Server{}
-		g.Add(func() error {
-			logger.Info("server ready", slog.String("addr", ln.Addr().String()))
-
-			return srv.Serve(ln)
-		}, func(err error) {
-			if err := srv.Close(); err != nil {
-				logger.Error("shutdown server", err)
-			}
-		})
+		for _, ln := range listeners {
+			ln := ln
+			g.Add(func() error {
+				logger.Info("server ready", slog.String("addr", ln.Addr().String()))
+				return srv.Serve(ln)
+			}, func(err error) {
+				if err := srv.Close(); err != nil {
+					logger.Error("shutdown server", err)
+				}
+				cancel()
+			})
+		}
 	}
 
 	for i, upstream := range upstreams {
