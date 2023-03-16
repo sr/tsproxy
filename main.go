@@ -74,6 +74,7 @@ type upstream struct {
 	name       string
 	backend    *url.URL
 	prometheus bool
+	funnel     bool
 }
 
 type target struct {
@@ -98,6 +99,8 @@ func parseUpstreamFlag(fval string) (upstream, error) {
 			switch opt {
 			case "prometheus":
 				up.prometheus = true
+			case "funnel":
+				up.funnel = true
 			default:
 				return upstream{}, fmt.Errorf("unsupported option: %v", opt)
 			}
@@ -257,6 +260,15 @@ func tsproxy(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
 			}
+
+			if upstream.funnel {
+				ln, err := ts.ListenFunnel("tcp", ":443")
+				if err != nil {
+					return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
+				}
+				return srv.Serve(ln)
+			}
+
 			ln, err := ts.Listen("tcp", ":443")
 			if err != nil {
 				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)

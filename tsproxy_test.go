@@ -51,6 +51,10 @@ func TestParseUpstream(t *testing.T) {
 			want:     upstream{name: "test", backend: mustParseURL("http://localhost"), prometheus: true},
 		},
 		{
+			upstream: "test=http://localhost;funnel;prometheus",
+			want:     upstream{name: "test", backend: mustParseURL("http://localhost"), prometheus: true, funnel: true},
+		},
+		{
 			upstream: "test=http://localhost;foo",
 			want:     upstream{},
 			err:      errors.New("unsupported option: foo"),
