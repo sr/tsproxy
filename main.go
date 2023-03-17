@@ -191,7 +191,7 @@ func tsproxy(ctx context.Context) error {
 				return srv.Serve(ln)
 			}, func(err error) {
 				if err := srv.Close(); err != nil {
-					logger.Error("shutdown server", err)
+					logger.Error("shutdown server", lerr(err))
 				}
 				cancel()
 			})
@@ -251,7 +251,7 @@ func tsproxy(ctx context.Context) error {
 			return srv.Serve(ln)
 		}, func(err error) {
 			if err := srv.Close(); err != nil {
-				log.Error("server shutdown", err)
+				log.Error("server shutdown", lerr(err))
 			}
 			cancel()
 		})
@@ -264,7 +264,7 @@ func tsproxy(ctx context.Context) error {
 			if upstream.funnel {
 				ln, err := ts.ListenFunnel("tcp", ":443")
 				if err != nil {
-					return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
+					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.name, err)
 				}
 				return srv.Serve(ln)
 			}
@@ -276,7 +276,7 @@ func tsproxy(ctx context.Context) error {
 			return srv.ServeTLS(ln, "", "")
 		}, func(err error) {
 			if err := srv.Close(); err != nil {
-				log.Error("TLS server shutdown", err)
+				log.Error("TLS server shutdown", lerr(err))
 			}
 			cancel()
 		})

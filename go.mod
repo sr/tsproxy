@@ -6,7 +6,7 @@ require (
 	github.com/google/go-cmp v0.5.9
 	github.com/oklog/run v1.1.0
 	github.com/prometheus/client_golang v1.14.0
-	golang.org/x/exp v0.0.0-20230203172020-98cc5a0785f9
+	golang.org/x/exp v0.0.0-20230315142452-642cacee5cc0
 	tailscale.com v1.38.1
 )
 

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -28,21 +27,21 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 	}
 	rproxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-		logger.Error("upstream error", err)
+		logger.Error("upstream error", lerr(err))
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.Error("tailscale whois", err)
+			logger.Error("tailscale whois", lerr(err))
 			return
 		}
 
 		// TODO(sr) Forbid access to tagged users (i.e. machines)?
 		if whois.UserProfile == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.Error("tailscale whois", errors.New("user profile missing"))
+			logger.Error("tailscale whois", slog.String("err", "user profile missing"))
 			return
 		}
 
@@ -80,4 +79,8 @@ func serveDiscovery(self string, targets []target) http.Handler {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_, _ = w.Write(buf)
 	})
+}
+
+func lerr(err error) slog.Attr {
+	return slog.String("err", err.Error())
 }
