@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
 
-	"golang.org/x/exp/slog"
 	"tailscale.com/client/tailscale/apitype"
 )
 

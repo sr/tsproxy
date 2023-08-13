@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"golang.org/x/exp/slog"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
@@ -140,7 +140,7 @@ func TestReverseProxy(t *testing.T) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard)), lc, beURL))
+			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, beURL))
 			defer px.Close()
 
 			resp, err := http.Get(px.URL)

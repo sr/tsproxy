@@ -15,11 +15,12 @@ import (
 	"strings"
 	"syscall"
 
+	"log/slog"
+
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/exp/slog"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
@@ -141,7 +142,7 @@ func tsproxy(ctx context.Context) error {
 		state = &dir
 	}
 
-	logger := slog.New((slog.HandlerOptions{}).NewJSONHandler(os.Stderr))
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
 
 	// If tailscaled isn't ready yet, just crash.
