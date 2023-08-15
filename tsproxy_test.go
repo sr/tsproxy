@@ -114,9 +114,23 @@ func TestReverseProxy(t *testing.T) {
 			want: http.StatusInternalServerError,
 		},
 		{
-			name: "tailscale whois ok",
+			name: "tailscale whois no node",
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
-				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}}, nil
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login"}}, nil
+			},
+			want: http.StatusInternalServerError,
+		},
+		{
+			name: "tailscale whois ok (tagged node)",
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+			},
+			want: http.StatusOK,
+		},
+		{
+			name: "tailscale whois ok (user)",
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
 			},
 			want: http.StatusOK,
 			wantHeaders: map[string]string{

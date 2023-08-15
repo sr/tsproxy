@@ -38,17 +38,27 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 			return
 		}
 
-		// TODO(sr) Forbid access to tagged users (i.e. machines)?
+		if whois.Node == nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.Error("tailscale whois", slog.String("err", "node missing"))
+			return
+		}
+
 		if whois.UserProfile == nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 			logger.Error("tailscale whois", slog.String("err", "user profile missing"))
 			return
 		}
 
+		// Proxy requests from tagged nodes as is.
+		if whois.Node.IsTagged() {
+			rproxy.ServeHTTP(w, r)
+			return
+		}
+
 		req := r.Clone(r.Context())
 		req.Header.Set("X-Webauth-User", whois.UserProfile.LoginName)
 		req.Header.Set("X-Webauth-Name", whois.UserProfile.DisplayName)
-
 		rproxy.ServeHTTP(w, req)
 	})
 }
