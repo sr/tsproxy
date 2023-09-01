@@ -150,6 +150,9 @@ func tsproxy(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("tailscale: get node status: %w", err)
 	}
+	if v := len(st.Self.TailscaleIPs); v != 2 {
+		return fmt.Errorf("want 2 tailscale IPs, got %d", v)
+	}
 
 	// service discovery targets (self + all upstreams)
 	targets := make([]target, len(upstreams)+1)
