@@ -240,7 +240,7 @@ func tsproxy(ctx context.Context) error {
 			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.name}),
 				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
 					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
-						newReverseProxy(log.With(slog.String("upstream", upstream.name)), lc, upstream.backend)))),
+						newReverseProxy(log, lc, upstream.backend)))),
 		}
 
 		g.Add(func() error {
