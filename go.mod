@@ -6,7 +6,7 @@ require (
 	github.com/google/go-cmp v0.5.9
 	github.com/oklog/run v1.1.0
 	github.com/prometheus/client_golang v1.15.1
-	tailscale.com v1.48.1
+	tailscale.com v1.48.2
 )
 
 require (
