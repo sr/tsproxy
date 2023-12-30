@@ -161,6 +161,8 @@ func TestReverseProxy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer resp.Body.Close()
+
 			if want, got := tc.want, resp.StatusCode; want != got {
 				t.Errorf("want status %d, got: %d", want, got)
 			}

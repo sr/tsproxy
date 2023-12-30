@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,8 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-
-	"log/slog"
 
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
@@ -140,7 +139,7 @@ func tsproxy(ctx context.Context) error {
 			return err
 		}
 		dir := filepath.Join(v, "tsproxy")
-		if err := os.MkdirAll(dir, 0700); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 		state = &dir
@@ -226,7 +225,7 @@ func tsproxy(ctx context.Context) error {
 		} else {
 			ts.Logf = tslogger.Discard
 		}
-		if err := os.MkdirAll(ts.Dir, 0700); err != nil {
+		if err := os.MkdirAll(ts.Dir, 0o700); err != nil {
 			return err
 		}
 
