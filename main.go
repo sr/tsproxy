@@ -28,7 +28,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -100,13 +99,15 @@ func tsproxy(ctx context.Context) error {
 	slog.SetDefault(logger)
 
 	// If tailscaled isn't ready yet, just crash.
-	st, err := (&tailscale.LocalClient{}).Status(ctx)
-	if err != nil {
-		return fmt.Errorf("tailscale: get node status: %w", err)
-	}
-	if v := len(st.Self.TailscaleIPs); v != 2 {
-		return fmt.Errorf("want 2 tailscale IPs, got %d", v)
-	}
+	/*
+		st, err := (&tailscale.LocalClient{}).Status(ctx)
+		if err != nil {
+			return fmt.Errorf("tailscale: get node status: %w", err)
+		}
+		if v := len(st.Self.TailscaleIPs); v != 2 {
+			return fmt.Errorf("want 2 tailscale IPs, got %d", v)
+		}
+	*/
 
 	// service discovery targets (self + all upstreams)
 	targets := make([]target, len(cfg.Upstreams)+1)
@@ -120,16 +121,22 @@ func tsproxy(ctx context.Context) error {
 		p := strconv.Itoa(cfg.MetricsDiscoveryPort)
 
 		var listeners []net.Listener
-		for _, ip := range st.Self.TailscaleIPs {
-			ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
-			if err != nil {
-				return fmt.Errorf("listen on %s:%d: %w", ip, cfg.MetricsDiscoveryPort, err)
-			}
-			listeners = append(listeners, ln)
+		/*
+			for _, ip := range st.Self.TailscaleIPs {
+				ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
+				if err != nil {
+					return fmt.Errorf("listen on %s:%d: %w", ip, cfg.MetricsDiscoveryPort, err)
+				}
+				listeners = append(listeners, ln)
+			}*/
+		ln, err := net.Listen("tcp", "0.0.0.0:"+p)
+		if err != nil {
+			return fmt.Errorf("creating metrics listener: %w", err)
 		}
+		listeners = append(listeners, ln)
 
 		http.Handle("/metrics", promhttp.Handler())
-		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
+		//http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`<html>
 				<head><title>tsproxy</title></head>
