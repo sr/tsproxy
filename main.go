@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
@@ -186,19 +188,46 @@ func tsproxy(ctx context.Context) error {
 
 		log.Info(fmt.Sprintf("backend %s upstream %#v", upstream.Name, backendURL))
 
-		srv := &http.Server{
-			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
-				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
-					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
-						newReverseProxy(log, lc, backendURL)))),
+		// newServers constructs a http.Server with the base middleware/config
+		// in place.
+		newServer := func(h http.Handler) *http.Server {
+			return &http.Server{
+				TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
+				Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
+					promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+						promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+							h))),
+			}
 		}
 
+		httpInterruptFunc := func(ctx context.Context, cancel func(), svr **http.Server) func(error) {
+			return func(error) {
+				if (*svr) != nil {
+					shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
+					defer shutdownCancel()
+					if err := (*svr).Shutdown(shutdownCtx); err != nil {
+						log.Error("server shutdown", lerr(err))
+					}
+				}
+				cancel()
+			}
+		}
+
+		var (
+			httpServer          *http.Server
+			httpCtx, httpCancel = context.WithCancel(ctx)
+		)
+
 		g.Add(func() error {
-			st, err := ts.Up(ctx)
+			st, err := ts.Up(httpCtx)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
+
+			go func() {
+				<-httpCtx.Done()
+				log.Info("http context done")
+			}()
 
 			// register in service discovery when we're ready.
 			targets[i] = target{name: upstream.Name, prometheus: upstream.Prometheus, magicDNS: st.Self.DNSName}
@@ -207,41 +236,94 @@ func tsproxy(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
 			}
-			return srv.Serve(ln)
-		}, func(err error) {
-			if err := srv.Close(); err != nil {
-				log.Error("server shutdown", lerr(err))
-			}
-			cancel()
-		})
+
+			rp := newReverseProxy(log, lc, backendURL)
+
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !upstream.Funnel {
+					rp.ServeHTTP(w, r)
+					return
+				}
+
+				// if here, we have a funnel service too. To keep urls
+				// consistent between funnel and non-funnel access, force TLS.
+				// We need the cert anyway for funnel. If accessed by the short
+				// hostname though, just allow that through as that'd never map
+				// to the funnel side.
+				if len(strings.Split(r.Host, ".")) == 1 || r.URL.Scheme == "https" {
+					rp.ServeHTTP(w, r)
+					return
+				}
+
+				http.Redirect(w, r, fmt.Sprintf("https://%s%s", strings.TrimSuffix(st.Self.DNSName, "."), r.RequestURI), http.StatusMovedPermanently)
+			})
+
+			httpServer = newServer(h)
+
+			return httpServer.Serve(ln)
+		}, httpInterruptFunc(httpCtx, httpCancel, &httpServer))
+
+		var (
+			httpsServer           *http.Server
+			httpsCtx, httpsCancel = context.WithCancel(ctx)
+		)
+
 		g.Add(func() error {
-			_, err := ts.Up(ctx)
+			_, err := ts.Up(httpsCtx)
 			if err != nil {
 				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
 
-			if upstream.Funnel {
-				ln, err := ts.ListenFunnel("tcp", ":443")
-				if err != nil {
-					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
-				}
-				return srv.Serve(ln)
-			}
+			go func() {
+				<-httpsCtx.Done()
+				log.Info("https context done")
+			}()
 
 			ln, err := ts.Listen("tcp", ":443")
 			if err != nil {
 				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.Name, err)
 			}
-			return srv.ServeTLS(ln, "", "")
-		}, func(err error) {
-			if err := srv.Close(); err != nil {
-				log.Error("TLS server shutdown", lerr(err))
-			}
-			cancel()
-		})
+
+			httpsServer = newServer(newReverseProxy(log, lc, backendURL))
+
+			return httpsServer.ServeTLS(ln, "", "")
+		}, httpInterruptFunc(httpsCtx, httpsCancel, &httpsServer))
+
+		if upstream.Funnel {
+			var (
+				funnelServer            *http.Server
+				funnelCtx, funnelCancel = context.WithCancel(ctx)
+			)
+
+			g.Add(func() error {
+				_, err := ts.Up(funnelCtx)
+				if err != nil {
+					return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
+				}
+
+				go func() {
+					<-funnelCtx.Done()
+					log.Info("funnel context done")
+				}()
+
+				ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
+				if err != nil {
+					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
+				}
+
+				rp := newReverseProxy(log, lc, backendURL)
+
+				funnelServer = newServer(rp)
+
+				return funnelServer.Serve(ln)
+			}, httpInterruptFunc(funnelCtx, funnelCancel, &funnelServer))
+		}
 	}
 
-	return g.Run()
+	if err := g.Run(); err != nil {
+		return fmt.Errorf("group run error: %w", err)
+	}
+	return nil
 }
 
 type tailscaleLocalClient interface {
