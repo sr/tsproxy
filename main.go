@@ -13,12 +13,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/lstoll/oidc/middleware"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -237,7 +239,7 @@ func tsproxy(ctx context.Context) error {
 				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
 			}
 
-			rp := newReverseProxy(log, lc, backendURL)
+			rp := newReverseProxy(log, lc, backendURL, false)
 
 			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if !upstream.Funnel {
@@ -284,7 +286,7 @@ func tsproxy(ctx context.Context) error {
 				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.Name, err)
 			}
 
-			httpsServer = newServer(newReverseProxy(log, lc, backendURL))
+			httpsServer = newServer(newReverseProxy(log, lc, backendURL, false))
 
 			return httpsServer.ServeTLS(ln, "", "")
 		}, httpInterruptFunc(httpsCtx, httpsCancel, &httpsServer))
@@ -296,7 +298,7 @@ func tsproxy(ctx context.Context) error {
 			)
 
 			g.Add(func() error {
-				_, err := ts.Up(funnelCtx)
+				st, err := ts.Up(funnelCtx)
 				if err != nil {
 					return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 				}
@@ -311,9 +313,36 @@ func tsproxy(ctx context.Context) error {
 					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
 				}
 
-				rp := newReverseProxy(log, lc, backendURL)
+				rp := newReverseProxy(log, lc, backendURL, true)
 
-				funnelServer = newServer(rp)
+				// TODO pass public paths direct to the proxy
+				mux := http.NewServeMux()
+
+				for _, p := range upstream.FunnelPublicPatterns {
+					mux.Handle(p, rp)
+				}
+
+				if upstream.OIDCIssuer != "" {
+					baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
+
+					oidcm := &middleware.Handler{
+						Issuer:           upstream.OIDCIssuer,
+						ClientID:         upstream.OIDCClientID,
+						ClientSecret:     upstream.OIDCClientSecret,
+						BaseURL:          baseURL,
+						RedirectURL:      baseURL + "/.tsproxy/oidc-callback",
+						SessionStore:     &cookieAuthSession{},
+						AdditionalScopes: []string{"profile"}, // make sure we have email etc.
+					}
+					mux.Handle("/", oidcm.Wrap(rp)) // fallback to authed path.
+				} else if !slices.Contains(upstream.FunnelPublicPatterns, "/") {
+					// no OIDC auth, no root pattern, default behaviour is to block.
+					mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+						http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+					})
+				}
+
+				funnelServer = newServer(mux)
 
 				return funnelServer.Serve(ln)
 			}, httpInterruptFunc(funnelCtx, funnelCancel, &funnelServer))
@@ -330,7 +359,7 @@ type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
 }
 
-func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {
+func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL, isFunnel bool) http.HandlerFunc {
 	// TODO(sr) Instrument proxy.Transport
 	rproxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -345,6 +374,8 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// lookup and check whois regardless, extra check to make sure traffic
+		// is coming over the valid tailscale net.
 		whois, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -364,15 +395,35 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 			return
 		}
 
-		// Proxy requests from tagged nodes as is.
-		if whois.Node.IsTagged() {
+		// Proxy requests from non-funnel tagged nodes as is.
+		//
+		// TODO(lstoll) figure out why - and if end-user nodes would be tagged?
+		if whois.Node.IsTagged() && !isFunnel {
 			rproxy.ServeHTTP(w, r)
 			return
 		}
 
+		loginName := whois.UserProfile.LoginName
+		displayName := whois.UserProfile.DisplayName
+
+		if isFunnel {
+			cl := middleware.ClaimsFromContext(r.Context())
+			if cl != nil {
+				email := cl.Extra["email"].(string)
+				name := cl.Extra["name"].(string)
+				if email == "" || name == "" {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					logger.Error("oidc id token missing name or email", slog.String("email", email), slog.String("name", name))
+					return
+				}
+				loginName = email
+				displayName = name
+			}
+		}
+
 		req := r.Clone(r.Context())
-		req.Header.Set("X-Webauth-User", whois.UserProfile.LoginName)
-		req.Header.Set("X-Webauth-Name", whois.UserProfile.DisplayName)
+		req.Header.Set("X-Webauth-User", loginName)
+		req.Header.Set("X-Webauth-Name", displayName)
 		rproxy.ServeHTTP(w, req)
 	})
 }

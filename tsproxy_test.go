@@ -99,7 +99,7 @@ func TestReverseProxy(t *testing.T) {
 			if err != nil {
 				log.Fatal(err)
 			}
-			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, beURL))
+			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, beURL, false))
 			defer px.Close()
 
 			resp, err := http.Get(px.URL)

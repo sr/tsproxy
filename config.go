@@ -40,6 +40,20 @@ type upstream struct {
 	Backend    string `json:"backend"`
 	Prometheus bool   `json:"prometheus"`
 	Funnel     bool   `json:"funnel"`
+
+	// FunnelPublicPatterns sets the list of patterns where public (aka
+	// unauthenticated) access are allowed. If not set, no open access is
+	// permitted - and auth must be configured. The patterns are in
+	// http.ServeMux format.
+	FunnelPublicPatterns []string `json:"funnelPublicPatterns"`
+
+	// OIDCIssuer sets the issuer to authenticate funnel access with. Any
+	// patterns not labeled as public will be handled by this.
+	OIDCIssuer string `json:"oidcIssuer"`
+	// OIDCClientID sets the OIDC client ID
+	OIDCClientID string `json:"oidcClientID"`
+	// OIDCClientSecret sets the OIDC client secret
+	OIDCClientSecret string `json:"oidcClientSecret"`
 }
 
 type kubernetesConfig struct {
@@ -85,6 +99,15 @@ func parseAndValidateConfig(cfg []byte) (config, error) {
 			_, err := url.Parse(u.Backend)
 			if err != nil {
 				verr = errors.Join(verr, fmt.Errorf("upstream %s backend url %s failed parsing: %w", u.Name, u.Backend, err))
+			}
+		}
+
+		if u.OIDCIssuer != "" {
+			if u.OIDCClientID == "" {
+				verr = errors.Join(verr, fmt.Errorf("upstream %s oidcClientID required", u.Name))
+			}
+			if u.OIDCClientSecret == "" {
+				verr = errors.Join(verr, fmt.Errorf("upstream %s oidcClientSecret required", u.Name))
 			}
 		}
 	}
