@@ -44,7 +44,7 @@ func (k *k8sStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				// unexpected
-				return nil, fmt.Errorf("fetching %s/%s from destination: %v", k.namespace, k.name, err)
+				return nil, fmt.Errorf("fetching %s/%s from destination: %v", k.namespace, k.secret, err)
 			}
 			return nil, ipn.ErrStateNotExist
 		}
@@ -74,7 +74,7 @@ func (k *k8sStateStore) WriteState(id ipn.StateKey, bs []byte) error {
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				// unexpected
-				return fmt.Errorf("fetching %s/%s from destination: %v", k.namespace, k.name, err)
+				return fmt.Errorf("fetching %s/%s from destination: %v", k.namespace, k.secret, err)
 			}
 			// item wasn't found, start with a new one
 			needsCreate = true
