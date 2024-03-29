@@ -27,14 +27,6 @@ func (c *fakeLocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apityp
 	return c.whois(ctx, remoteAddr)
 }
 
-func mustParseURL(s string) *url.URL {
-	v, err := url.Parse(s)
-	if err != nil {
-		panic(err)
-	}
-	return v
-}
-
 func TestReverseProxy(t *testing.T) {
 	t.Parallel()
 
