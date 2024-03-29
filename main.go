@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,8 +21,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/store"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
 )
@@ -84,17 +90,6 @@ func tsproxy(ctx context.Context) error {
 
 	if len(cfg.Upstreams) == 0 {
 		return fmt.Errorf("required flag missing: upstream")
-	}
-	if cfg.StateDir == "" {
-		v, err := os.UserCacheDir()
-		if err != nil {
-			return err
-		}
-		dir := filepath.Join(v, "tsproxy")
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		cfg.StateDir = dir
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
@@ -160,9 +155,19 @@ func tsproxy(ctx context.Context) error {
 	for i, upstream := range cfg.Upstreams {
 		log := logger.With(slog.String("upstream", upstream.Name))
 
+		backendURL, err := url.Parse(upstream.Backend)
+		if err != nil {
+			return fmt.Errorf("parsing backend url %s: %w", backendURL, err)
+		}
+
+		stateStore, err := stateStoreForUpstream(cfg, upstream.Name)
+		if err != nil {
+			return err
+		}
+
 		ts := &tsnet.Server{
 			Hostname: upstream.Name,
-			Dir:      filepath.Join(cfg.StateDir, "tailscale-"+upstream.Name),
+			Store:    stateStore,
 		}
 		defer ts.Close()
 
@@ -173,21 +178,20 @@ func tsproxy(ctx context.Context) error {
 		} else {
 			ts.Logf = tslogger.Discard
 		}
-		if err := os.MkdirAll(ts.Dir, 0o700); err != nil {
-			return err
-		}
 
 		lc, err := ts.LocalClient()
 		if err != nil {
 			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.Name, err)
 		}
 
+		log.Info(fmt.Sprintf("backend %s upstream %#v", upstream.Name, backendURL))
+
 		srv := &http.Server{
 			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
 			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
 				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
 					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
-						newReverseProxy(log, lc, upstream.backendURL)))),
+						newReverseProxy(log, lc, backendURL)))),
 		}
 
 		g.Add(func() error {
@@ -321,4 +325,48 @@ func serveDiscovery(self string, targets []target) http.Handler {
 
 func lerr(err error) slog.Attr {
 	return slog.String("err", err.Error())
+}
+
+var clientset kubernetes.Interface
+
+func stateStoreForUpstream(cfg config, upstreamName string) (ipn.StateStore, error) {
+	if cfg.Kubernetes.Enabled {
+		if clientset == nil {
+			var kubeConfig *rest.Config
+			if cfg.Kubernetes.KubeconfigPath != "" {
+				c, err := clientcmd.BuildConfigFromFlags("", cfg.Kubernetes.KubeconfigPath)
+				if err != nil {
+					return nil, fmt.Errorf("building kubeconfig from %s: %w", cfg.Kubernetes.KubeconfigPath, err)
+				}
+				kubeConfig = c
+			} else {
+				c, err := rest.InClusterConfig()
+				if err != nil {
+					return nil, fmt.Errorf("building in-cluster kubeconfig: %w", err)
+				}
+				kubeConfig = c
+			}
+			cs, err := kubernetes.NewForConfig(kubeConfig)
+			if err != nil {
+				return nil, fmt.Errorf("building kubernetes clientset: %w", err)
+			}
+			clientset = cs
+		}
+		return &k8sStateStore{
+			clientset: clientset,
+			namespace: cfg.Kubernetes.Namespace,
+			secret:    cfg.Kubernetes.Secret,
+			name:      upstreamName,
+		}, nil
+	} else {
+		dir := filepath.Join(cfg.StateDir, "tailscale-"+upstreamName)
+		if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("creating %s: %w", dir, err)
+		}
+		st, err := store.NewFileStore(log.Printf, dir)
+		if err != nil {
+			return nil, fmt.Errorf("creating file store at %s: %w", dir, err)
+		}
+		return st, nil
+	}
 }
