@@ -4,9 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,17 +13,24 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/lstoll/oidc/middleware"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"tailscale.com/client/tailscale"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/store"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
 )
@@ -59,58 +65,10 @@ var (
 	)
 )
 
-type upstreamFlag []upstream
-
-func (f *upstreamFlag) String() string {
-	return fmt.Sprintf("%+v", *f)
-}
-
-func (f *upstreamFlag) Set(val string) error {
-	up, err := parseUpstreamFlag(val)
-	if err != nil {
-		return err
-	}
-	*f = append(*f, up)
-	return nil
-}
-
-type upstream struct {
-	name       string
-	backend    *url.URL
-	prometheus bool
-	funnel     bool
-}
-
 type target struct {
 	name       string
 	magicDNS   string
 	prometheus bool
-}
-
-func parseUpstreamFlag(fval string) (upstream, error) {
-	k, v, ok := strings.Cut(fval, "=")
-	if !ok {
-		return upstream{}, errors.New("format: name=http://backend")
-	}
-	val := strings.Split(v, ";")
-	be, err := url.Parse(val[0])
-	if err != nil {
-		return upstream{}, err
-	}
-	up := upstream{name: k, backend: be}
-	if len(val) > 1 {
-		for _, opt := range val[1:] {
-			switch opt {
-			case "prometheus":
-				up.prometheus = true
-			case "funnel":
-				up.funnel = true
-			default:
-				return upstream{}, fmt.Errorf("unsupported option: %v", opt)
-			}
-		}
-	}
-	return up, nil
 }
 
 func main() {
@@ -121,44 +79,38 @@ func main() {
 }
 
 func tsproxy(ctx context.Context) error {
-	var (
-		state = flag.String("state", "", "Optional directory for storing Tailscale state.")
-		tslog = flag.Bool("tslog", false, "If true, log Tailscale output.")
-		port  = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
-	)
-	var upstreams upstreamFlag
-	flag.Var(&upstreams, "upstream", "Repeated for each upstream. Format: name=http://backend:8000")
-	flag.Parse()
-
-	if len(upstreams) == 0 {
-		return fmt.Errorf("required flag missing: upstream")
+	if len(os.Args) != 2 {
+		return fmt.Errorf("usage: %s <path to config>", os.Args[0])
 	}
-	if *state == "" {
-		v, err := os.UserCacheDir()
-		if err != nil {
-			return err
-		}
-		dir := filepath.Join(v, "tsproxy")
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		state = &dir
+	cfgb, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		return fmt.Errorf("reading config file %s: %w", os.Args[1], err)
+	}
+	cfg, err := parseAndValidateConfig(cfgb)
+	if err != nil {
+		return fmt.Errorf("reading config file %s: %w", os.Args[1], err)
+	}
+
+	if len(cfg.Upstreams) == 0 {
+		return fmt.Errorf("required flag missing: upstream")
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
 
 	// If tailscaled isn't ready yet, just crash.
-	st, err := (&tailscale.LocalClient{}).Status(ctx)
-	if err != nil {
-		return fmt.Errorf("tailscale: get node status: %w", err)
-	}
-	if v := len(st.Self.TailscaleIPs); v != 2 {
-		return fmt.Errorf("want 2 tailscale IPs, got %d", v)
-	}
+	/*
+		st, err := (&tailscale.LocalClient{}).Status(ctx)
+		if err != nil {
+			return fmt.Errorf("tailscale: get node status: %w", err)
+		}
+		if v := len(st.Self.TailscaleIPs); v != 2 {
+			return fmt.Errorf("want 2 tailscale IPs, got %d", v)
+		}
+	*/
 
 	// service discovery targets (self + all upstreams)
-	targets := make([]target, len(upstreams)+1)
+	targets := make([]target, len(cfg.Upstreams)+1)
 
 	var g run.Group
 	ctx, cancel := context.WithCancel(ctx)
@@ -166,19 +118,25 @@ func tsproxy(ctx context.Context) error {
 	g.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
 
 	{
-		p := strconv.Itoa(*port)
+		p := strconv.Itoa(cfg.MetricsDiscoveryPort)
 
 		var listeners []net.Listener
-		for _, ip := range st.Self.TailscaleIPs {
-			ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
-			if err != nil {
-				return fmt.Errorf("listen on %s:%d: %w", ip, *port, err)
-			}
-			listeners = append(listeners, ln)
+		/*
+			for _, ip := range st.Self.TailscaleIPs {
+				ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
+				if err != nil {
+					return fmt.Errorf("listen on %s:%d: %w", ip, cfg.MetricsDiscoveryPort, err)
+				}
+				listeners = append(listeners, ln)
+			}*/
+		ln, err := net.Listen("tcp", "0.0.0.0:"+p)
+		if err != nil {
+			return fmt.Errorf("creating metrics listener: %w", err)
 		}
+		listeners = append(listeners, ln)
 
 		http.Handle("/metrics", promhttp.Handler())
-		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
+		//http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`<html>
 				<head><title>tsproxy</title></head>
@@ -205,98 +163,210 @@ func tsproxy(ctx context.Context) error {
 		}
 	}
 
-	for i, upstream := range upstreams {
-		// https://go.dev/doc/faq#closures_and_goroutines
-		i := i
-		upstream := upstream
+	for i, upstream := range cfg.Upstreams {
+		log := logger.With(slog.String("upstream", upstream.Name))
 
-		log := logger.With(slog.String("upstream", upstream.name))
+		backendURL, err := url.Parse(upstream.Backend)
+		if err != nil {
+			return fmt.Errorf("parsing backend url %s: %w", backendURL, err)
+		}
+
+		stateStore, err := stateStoreForUpstream(cfg, upstream.Name)
+		if err != nil {
+			return err
+		}
 
 		ts := &tsnet.Server{
-			Hostname: upstream.name,
-			Dir:      filepath.Join(*state, "tailscale-"+upstream.name),
+			Hostname: upstream.Name,
+			Store:    stateStore,
 		}
 		defer ts.Close()
 
-		if *tslog {
+		if cfg.LogTailscale {
 			ts.Logf = func(format string, args ...any) {
 				log.Info(fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
 			}
 		} else {
 			ts.Logf = tslogger.Discard
 		}
-		if err := os.MkdirAll(ts.Dir, 0o700); err != nil {
-			return err
-		}
 
 		lc, err := ts.LocalClient()
 		if err != nil {
-			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.name, err)
+			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.Name, err)
 		}
 
-		srv := &http.Server{
-			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.name}),
-				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
-					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
-						newReverseProxy(log, lc, upstream.backend)))),
+		log.Info(fmt.Sprintf("backend %s upstream %#v", upstream.Name, backendURL))
+
+		// newServers constructs a http.Server with the base middleware/config
+		// in place.
+		newServer := func(h http.Handler) *http.Server {
+			return &http.Server{
+				TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
+				Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
+					promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+						promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+							h))),
+			}
 		}
+
+		httpInterruptFunc := func(ctx context.Context, cancel func(), svr **http.Server) func(error) {
+			return func(error) {
+				if (*svr) != nil {
+					shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
+					defer shutdownCancel()
+					if err := (*svr).Shutdown(shutdownCtx); err != nil {
+						log.Error("server shutdown", lerr(err))
+					}
+				}
+				cancel()
+			}
+		}
+
+		var (
+			httpServer          *http.Server
+			httpCtx, httpCancel = context.WithCancel(ctx)
+		)
 
 		g.Add(func() error {
-			st, err := ts.Up(ctx)
+			st, err := ts.Up(httpCtx)
 			if err != nil {
-				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
 
+			go func() {
+				<-httpCtx.Done()
+				log.Info("http context done")
+			}()
+
 			// register in service discovery when we're ready.
-			targets[i] = target{name: upstream.name, prometheus: upstream.prometheus, magicDNS: st.Self.DNSName}
+			targets[i] = target{name: upstream.Name, prometheus: upstream.Prometheus, magicDNS: st.Self.DNSName}
 
 			ln, err := ts.Listen("tcp", ":80")
 			if err != nil {
-				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.name, err)
-			}
-			return srv.Serve(ln)
-		}, func(err error) {
-			if err := srv.Close(); err != nil {
-				log.Error("server shutdown", lerr(err))
-			}
-			cancel()
-		})
-		g.Add(func() error {
-			_, err := ts.Up(ctx)
-			if err != nil {
-				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
 			}
 
-			if upstream.funnel {
-				ln, err := ts.ListenFunnel("tcp", ":443")
-				if err != nil {
-					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.name, err)
+			rp := newReverseProxy(log, lc, backendURL, false)
+
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !upstream.Funnel {
+					rp.ServeHTTP(w, r)
+					return
 				}
-				return srv.Serve(ln)
+
+				// if here, we have a funnel service too. To keep urls
+				// consistent between funnel and non-funnel access, force TLS.
+				// We need the cert anyway for funnel. If accessed by the short
+				// hostname though, just allow that through as that'd never map
+				// to the funnel side.
+				if len(strings.Split(r.Host, ".")) == 1 || r.URL.Scheme == "https" {
+					rp.ServeHTTP(w, r)
+					return
+				}
+
+				http.Redirect(w, r, fmt.Sprintf("https://%s%s", strings.TrimSuffix(st.Self.DNSName, "."), r.RequestURI), http.StatusMovedPermanently)
+			})
+
+			httpServer = newServer(h)
+
+			return httpServer.Serve(ln)
+		}, httpInterruptFunc(httpCtx, httpCancel, &httpServer))
+
+		var (
+			httpsServer           *http.Server
+			httpsCtx, httpsCancel = context.WithCancel(ctx)
+		)
+
+		g.Add(func() error {
+			_, err := ts.Up(httpsCtx)
+			if err != nil {
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
+
+			go func() {
+				<-httpsCtx.Done()
+				log.Info("https context done")
+			}()
 
 			ln, err := ts.Listen("tcp", ":443")
 			if err != nil {
-				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.Name, err)
 			}
-			return srv.ServeTLS(ln, "", "")
-		}, func(err error) {
-			if err := srv.Close(); err != nil {
-				log.Error("TLS server shutdown", lerr(err))
-			}
-			cancel()
-		})
+
+			httpsServer = newServer(newReverseProxy(log, lc, backendURL, false))
+
+			return httpsServer.ServeTLS(ln, "", "")
+		}, httpInterruptFunc(httpsCtx, httpsCancel, &httpsServer))
+
+		if upstream.Funnel {
+			var (
+				funnelServer            *http.Server
+				funnelCtx, funnelCancel = context.WithCancel(ctx)
+			)
+
+			g.Add(func() error {
+				st, err := ts.Up(funnelCtx)
+				if err != nil {
+					return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
+				}
+
+				go func() {
+					<-funnelCtx.Done()
+					log.Info("funnel context done")
+				}()
+
+				ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
+				if err != nil {
+					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
+				}
+
+				rp := newReverseProxy(log, lc, backendURL, true)
+
+				// TODO pass public paths direct to the proxy
+				mux := http.NewServeMux()
+
+				for _, p := range upstream.FunnelPublicPatterns {
+					mux.Handle(p, rp)
+				}
+
+				if upstream.OIDCIssuer != "" {
+					baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
+
+					oidcm := &middleware.Handler{
+						Issuer:           upstream.OIDCIssuer,
+						ClientID:         upstream.OIDCClientID,
+						ClientSecret:     upstream.OIDCClientSecret,
+						BaseURL:          baseURL,
+						RedirectURL:      baseURL + "/.tsproxy/oidc-callback",
+						SessionStore:     &cookieAuthSession{},
+						AdditionalScopes: []string{"profile"}, // make sure we have email etc.
+					}
+					mux.Handle("/", oidcm.Wrap(rp)) // fallback to authed path.
+				} else if !slices.Contains(upstream.FunnelPublicPatterns, "/") {
+					// no OIDC auth, no root pattern, default behaviour is to block.
+					mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+						http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+					})
+				}
+
+				funnelServer = newServer(mux)
+
+				return funnelServer.Serve(ln)
+			}, httpInterruptFunc(funnelCtx, funnelCancel, &funnelServer))
+		}
 	}
 
-	return g.Run()
+	if err := g.Run(); err != nil {
+		return fmt.Errorf("group run error: %w", err)
+	}
+	return nil
 }
 
 type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
 }
 
-func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL) http.HandlerFunc {
+func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL, isFunnel bool) http.HandlerFunc {
 	// TODO(sr) Instrument proxy.Transport
 	rproxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
@@ -311,6 +381,8 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// lookup and check whois regardless, extra check to make sure traffic
+		// is coming over the valid tailscale net.
 		whois, err := lc.WhoIs(r.Context(), r.RemoteAddr)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -330,15 +402,35 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 			return
 		}
 
-		// Proxy requests from tagged nodes as is.
-		if whois.Node.IsTagged() {
+		// Proxy requests from non-funnel tagged nodes as is.
+		//
+		// TODO(lstoll) figure out why - and if end-user nodes would be tagged?
+		if whois.Node.IsTagged() && !isFunnel {
 			rproxy.ServeHTTP(w, r)
 			return
 		}
 
+		loginName := whois.UserProfile.LoginName
+		displayName := whois.UserProfile.DisplayName
+
+		if isFunnel {
+			cl := middleware.ClaimsFromContext(r.Context())
+			if cl != nil {
+				email := cl.Extra["email"].(string)
+				name := cl.Extra["name"].(string)
+				if email == "" || name == "" {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					logger.Error("oidc id token missing name or email", slog.String("email", email), slog.String("name", name))
+					return
+				}
+				loginName = email
+				displayName = name
+			}
+		}
+
 		req := r.Clone(r.Context())
-		req.Header.Set("X-Webauth-User", whois.UserProfile.LoginName)
-		req.Header.Set("X-Webauth-Name", whois.UserProfile.DisplayName)
+		req.Header.Set("X-Webauth-User", loginName)
+		req.Header.Set("X-Webauth-Name", displayName)
 		rproxy.ServeHTTP(w, req)
 	})
 }
@@ -373,4 +465,48 @@ func serveDiscovery(self string, targets []target) http.Handler {
 
 func lerr(err error) slog.Attr {
 	return slog.String("err", err.Error())
+}
+
+var clientset kubernetes.Interface
+
+func stateStoreForUpstream(cfg config, upstreamName string) (ipn.StateStore, error) {
+	if cfg.Kubernetes.Enabled {
+		if clientset == nil {
+			var kubeConfig *rest.Config
+			if cfg.Kubernetes.KubeconfigPath != "" {
+				c, err := clientcmd.BuildConfigFromFlags("", cfg.Kubernetes.KubeconfigPath)
+				if err != nil {
+					return nil, fmt.Errorf("building kubeconfig from %s: %w", cfg.Kubernetes.KubeconfigPath, err)
+				}
+				kubeConfig = c
+			} else {
+				c, err := rest.InClusterConfig()
+				if err != nil {
+					return nil, fmt.Errorf("building in-cluster kubeconfig: %w", err)
+				}
+				kubeConfig = c
+			}
+			cs, err := kubernetes.NewForConfig(kubeConfig)
+			if err != nil {
+				return nil, fmt.Errorf("building kubernetes clientset: %w", err)
+			}
+			clientset = cs
+		}
+		return &k8sStateStore{
+			clientset: clientset,
+			namespace: cfg.Kubernetes.Namespace,
+			secret:    cfg.Kubernetes.Secret,
+			name:      upstreamName,
+		}, nil
+	} else {
+		dir := filepath.Join(cfg.StateDir, "tailscale-"+upstreamName)
+		if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+			return nil, fmt.Errorf("creating %s: %w", dir, err)
+		}
+		st, err := store.NewFileStore(log.Printf, dir)
+		if err != nil {
+			return nil, fmt.Errorf("creating file store at %s: %w", dir, err)
+		}
+		return st, nil
+	}
 }
