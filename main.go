@@ -179,7 +179,7 @@ func tsproxy(ctx context.Context) error {
 
 		http.Handle("/metrics", promhttp.Handler())
 		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`<html>
 				<head><title>tsproxy</title></head>
 				<body>
@@ -196,7 +196,7 @@ func tsproxy(ctx context.Context) error {
 			g.Add(func() error {
 				logger.Info("server ready", slog.String("addr", ln.Addr().String()))
 				return srv.Serve(ln)
-			}, func(err error) {
+			}, func(_ error) {
 				if err := srv.Close(); err != nil {
 					logger.Error("shutdown server", lerr(err))
 				}
@@ -220,6 +220,7 @@ func tsproxy(ctx context.Context) error {
 
 		if *tslog {
 			ts.Logf = func(format string, args ...any) {
+				//nolint: sloglint
 				log.Info(fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
 			}
 		} else {
@@ -256,7 +257,7 @@ func tsproxy(ctx context.Context) error {
 				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.name, err)
 			}
 			return srv.Serve(ln)
-		}, func(err error) {
+		}, func(_ error) {
 			if err := srv.Close(); err != nil {
 				log.Error("server shutdown", lerr(err))
 			}
@@ -281,7 +282,7 @@ func tsproxy(ctx context.Context) error {
 				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
 			}
 			return srv.ServeTLS(ln, "", "")
-		}, func(err error) {
+		}, func(_ error) {
 			if err := srv.Close(); err != nil {
 				log.Error("TLS server shutdown", lerr(err))
 			}
@@ -305,7 +306,7 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 			req.Out.Host = req.In.Host
 		},
 	}
-	rproxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+	rproxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		logger.Error("upstream error", lerr(err))
 	}
@@ -344,7 +345,7 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL)
 }
 
 func serveDiscovery(self string, targets []target) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var tgs []string
 		tgs = append(tgs, self)
 		for _, t := range targets {
