@@ -213,8 +213,9 @@ func tsproxy(ctx context.Context) error {
 		log := logger.With(slog.String("upstream", upstream.name))
 
 		ts := &tsnet.Server{
-			Hostname: upstream.name,
-			Dir:      filepath.Join(*state, "tailscale-"+upstream.name),
+			Hostname:     upstream.name,
+			Dir:          filepath.Join(*state, "tailscale-"+upstream.name),
+			RunWebClient: true,
 		}
 		defer ts.Close()
 
