@@ -21,8 +21,10 @@ import (
 
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tsnet"
@@ -125,10 +127,16 @@ func tsproxy(ctx context.Context) error {
 		state = flag.String("state", "", "Optional directory for storing Tailscale state.")
 		tslog = flag.Bool("tslog", false, "If true, log Tailscale output.")
 		port  = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
+		ver   = flag.Bool("version", false, "print the version and exit")
 	)
 	var upstreams upstreamFlag
 	flag.Var(&upstreams, "upstream", "Repeated for each upstream. Format: name=http://backend:8000")
 	flag.Parse()
+
+	if *ver {
+		fmt.Fprintln(os.Stdout, version.Print("tsproxy"))
+		os.Exit(0)
+	}
 
 	if len(upstreams) == 0 {
 		return fmt.Errorf("required flag missing: upstream")
@@ -144,6 +152,7 @@ func tsproxy(ctx context.Context) error {
 		}
 		state = &dir
 	}
+	prometheus.MustRegister(versioncollector.NewCollector("tsproxy"))
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
