@@ -23,7 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
@@ -149,7 +149,7 @@ func tsproxy(ctx context.Context) error {
 	slog.SetDefault(logger)
 
 	// If tailscaled isn't ready yet, just crash.
-	st, err := (&tailscale.LocalClient{}).Status(ctx)
+	st, err := (&local.Client{}).Status(ctx)
 	if err != nil {
 		return fmt.Errorf("tailscale: get node status: %w", err)
 	}
