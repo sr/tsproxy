@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,7 +15,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/oklog/run"
@@ -25,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
+	"github.com/tailscale/hujson"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tsnet"
@@ -61,58 +60,17 @@ var (
 	)
 )
 
-type upstreamFlag []upstream
-
-func (f *upstreamFlag) String() string {
-	return fmt.Sprintf("%+v", *f)
-}
-
-func (f *upstreamFlag) Set(val string) error {
-	up, err := parseUpstreamFlag(val)
-	if err != nil {
-		return err
-	}
-	*f = append(*f, up)
-	return nil
-}
-
 type upstream struct {
-	name       string
-	backend    *url.URL
-	prometheus bool
-	funnel     bool
+	Name       string
+	Backend    string
+	Prometheus bool
+	Funnel     bool
 }
 
 type target struct {
 	name       string
 	magicDNS   string
 	prometheus bool
-}
-
-func parseUpstreamFlag(fval string) (upstream, error) {
-	k, v, ok := strings.Cut(fval, "=")
-	if !ok {
-		return upstream{}, errors.New("format: name=http://backend")
-	}
-	val := strings.Split(v, ";")
-	be, err := url.Parse(val[0])
-	if err != nil {
-		return upstream{}, err
-	}
-	up := upstream{name: k, backend: be}
-	if len(val) > 1 {
-		for _, opt := range val[1:] {
-			switch opt {
-			case "prometheus":
-				up.prometheus = true
-			case "funnel":
-				up.funnel = true
-			default:
-				return upstream{}, fmt.Errorf("unsupported option: %v", opt)
-			}
-		}
-	}
-	return up, nil
 }
 
 func main() {
@@ -124,13 +82,12 @@ func main() {
 
 func tsproxy(ctx context.Context) error {
 	var (
-		state = flag.String("state", "", "Optional directory for storing Tailscale state.")
-		tslog = flag.Bool("tslog", false, "If true, log Tailscale output.")
-		port  = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
-		ver   = flag.Bool("version", false, "print the version and exit")
+		state  = flag.String("state", "", "Optional directory for storing Tailscale state.")
+		tslog  = flag.Bool("tslog", false, "If true, log Tailscale output.")
+		port   = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
+		ver    = flag.Bool("version", false, "print the version and exit")
+		upfile = flag.String("upstream", "", "path to upstreams config file")
 	)
-	var upstreams upstreamFlag
-	flag.Var(&upstreams, "upstream", "Repeated for each upstream. Format: name=http://backend:8000")
 	flag.Parse()
 
 	if *ver {
@@ -138,9 +95,26 @@ func tsproxy(ctx context.Context) error {
 		os.Exit(0)
 	}
 
-	if len(upstreams) == 0 {
+	if *upfile == "" {
 		return fmt.Errorf("required flag missing: upstream")
 	}
+
+	in, err := os.ReadFile(*upfile)
+	if err != nil {
+		return err
+	}
+	inJSON, err := hujson.Standardize(in)
+	if err != nil {
+		return fmt.Errorf("hujson: %w", err)
+	}
+	var upstreams []upstream
+	if err := json.Unmarshal(inJSON, &upstreams); err != nil {
+		return fmt.Errorf("json: %w", err)
+	}
+	if len(upstreams) == 0 {
+		return fmt.Errorf("file does not contain any upstreams: %s", *upfile)
+	}
+
 	if *state == "" {
 		v, err := os.UserCacheDir()
 		if err != nil {
@@ -215,15 +189,11 @@ func tsproxy(ctx context.Context) error {
 	}
 
 	for i, upstream := range upstreams {
-		// https://go.dev/doc/faq#closures_and_goroutines
-		i := i
-		upstream := upstream
-
-		log := logger.With(slog.String("upstream", upstream.name))
+		log := logger.With(slog.String("upstream", upstream.Name))
 
 		ts := &tsnet.Server{
-			Hostname:     upstream.name,
-			Dir:          filepath.Join(*state, "tailscale-"+upstream.name),
+			Hostname:     upstream.Name,
+			Dir:          filepath.Join(*state, "tailscale-"+upstream.Name),
 			RunWebClient: true,
 		}
 		defer ts.Close()
@@ -242,29 +212,34 @@ func tsproxy(ctx context.Context) error {
 
 		lc, err := ts.LocalClient()
 		if err != nil {
-			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.name, err)
+			return fmt.Errorf("tailscale: get local client for %s: %w", upstream.Name, err)
+		}
+
+		backendURL, err := url.Parse(upstream.Backend)
+		if err != nil {
+			return fmt.Errorf("upstream %s: parse backend URL: %w", upstream.Name, err)
 		}
 
 		srv := &http.Server{
 			TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.name}),
-				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
-					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.name}),
-						newReverseProxy(log, lc, upstream.backend)))),
+			Handler: promhttp.InstrumentHandlerInFlight(requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
+				promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+					promhttp.InstrumentHandlerCounter(requests.MustCurryWith(prometheus.Labels{"upstream": upstream.Name}),
+						newReverseProxy(log, lc, backendURL)))),
 		}
 
 		g.Add(func() error {
 			st, err := ts.Up(ctx)
 			if err != nil {
-				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
 
 			// register in service discovery when we're ready.
-			targets[i] = target{name: upstream.name, prometheus: upstream.prometheus, magicDNS: st.Self.DNSName}
+			targets[i] = target{name: upstream.Name, prometheus: upstream.Prometheus, magicDNS: st.Self.DNSName}
 
 			ln, err := ts.Listen("tcp", ":80")
 			if err != nil {
-				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
 			}
 			return srv.Serve(ln)
 		}, func(_ error) {
@@ -276,20 +251,20 @@ func tsproxy(ctx context.Context) error {
 		g.Add(func() error {
 			_, err := ts.Up(ctx)
 			if err != nil {
-				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: wait for node %s to be ready: %w", upstream.Name, err)
 			}
 
-			if upstream.funnel {
+			if upstream.Funnel {
 				ln, err := ts.ListenFunnel("tcp", ":443")
 				if err != nil {
-					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.name, err)
+					return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
 				}
 				return srv.Serve(ln)
 			}
 
 			ln, err := ts.Listen("tcp", ":443")
 			if err != nil {
-				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.name, err)
+				return fmt.Errorf("tailscale: listen for %s on port 443: %w", upstream.Name, err)
 			}
 			return srv.ServeTLS(ln, "", "")
 		}, func(_ error) {
