@@ -5,29 +5,33 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
 
 type fakeLocalClient struct {
-	whois func(context.Context, string) (*apitype.WhoIsResponse, error)
+	whois  func(context.Context, string) (*apitype.WhoIsResponse, error)
+	status func(context.Context) (*ipnstate.Status, error)
 }
 
 func (c *fakeLocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	return c.whois(ctx, remoteAddr)
 }
 
-func TestReverseProxy(t *testing.T) {
+func (c *fakeLocalClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
+	return c.status(ctx)
+}
+
+func TestLocalTailnetHandler(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -80,18 +84,13 @@ func TestReverseProxy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			lc := &fakeLocalClient{whois: tc.whois}
-			be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			be := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				for k, v := range r.Header {
 					w.Header().Set(k, v[0])
 				}
 				fmt.Fprintln(w, "Hi from the backend.")
-			}))
-			defer be.Close()
-			beURL, err := url.Parse(be.URL)
-			if err != nil {
-				log.Fatal(err)
-			}
-			px := httptest.NewServer(newReverseProxy(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, beURL))
+			})
+			px := httptest.NewServer(localTailnetHandler(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, be))
 			defer px.Close()
 
 			resp, err := http.Get(px.URL)
@@ -115,6 +114,59 @@ func TestReverseProxy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLocalTailnetTLSHandler(t *testing.T) {
+	t.Parallel()
+
+	lc := &fakeLocalClient{
+		whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+			return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+		},
+		status: func(_ context.Context) (*ipnstate.Status, error) {
+			return &ipnstate.Status{Self: &ipnstate.PeerStatus{DNSName: "foo.ts.net."}}, nil
+		},
+	}
+	be := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "Hi from the backend.")
+	})
+	px := httptest.NewTLSServer(localTailnetTLSHandler(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, be))
+	defer px.Close()
+
+	cli := px.Client()
+	cli.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, px.URL+"/bar", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if want, got := http.StatusPermanentRedirect, resp.StatusCode; want != got {
+		t.Fatalf("want status %d, got: %d", want, got)
+	}
+	if want, got := "https://foo.ts.net/bar", resp.Header.Get("location"); got != want {
+		t.Fatalf("want Location %s, got: %s", want, got)
+	}
+
+	req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, px.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "foo.ts.net"
+	resp, err = px.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if want, got := http.StatusOK, resp.StatusCode; want != got {
+		t.Fatalf("want status %d, got: %d", want, got)
 	}
 }
 
