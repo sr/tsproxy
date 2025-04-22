@@ -6,6 +6,7 @@ toolchain go1.24.2
 
 require (
 	github.com/google/go-cmp v0.7.0
+	github.com/lstoll/oidc v1.0.0-beta.4.0.20250106123456-6ffce62670fe
 	github.com/oklog/run v1.1.0
 	github.com/prometheus/client_golang v1.21.1
 	github.com/prometheus/common v0.63.0
@@ -75,6 +76,7 @@ require (
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wireguard-go v0.0.0-20250107165329-0b8b35511f19 // indirect
+	github.com/tink-crypto/tink-go/v2 v2.2.0 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
@@ -84,6 +86,7 @@ require (
 	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac // indirect
 	golang.org/x/mod v0.23.0 // indirect
 	golang.org/x/net v0.36.0 // indirect
+	golang.org/x/oauth2 v0.26.0 // indirect
 	golang.org/x/sync v0.11.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/term v0.29.0 // indirect

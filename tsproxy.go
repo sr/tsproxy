@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/lstoll/oidc"
+	"github.com/lstoll/oidc/middleware"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -28,7 +30,6 @@ import (
 	"github.com/tailscale/hujson"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 	tslogger "tailscale.com/types/logger"
 )
@@ -67,7 +68,14 @@ type upstream struct {
 	Name       string
 	Backend    string
 	Prometheus bool
-	Funnel     bool
+	Funnel     *funnelConfig
+}
+
+type funnelConfig struct {
+	Insecure     bool
+	Issuer       string
+	ClientID     string
+	ClientSecret string
 }
 
 type target struct {
@@ -256,7 +264,7 @@ func tsproxy(ctx context.Context) error {
 					return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
 				}
 
-				srv = &http.Server{Handler: instrument(localTailnetHandler(log, lc, proxy))}
+				srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, false, tailnet(log, lc, proxy)))}
 				ln, err := ts.Listen("tcp", ":80")
 				if err != nil {
 					return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
@@ -278,13 +286,14 @@ func tsproxy(ctx context.Context) error {
 		{
 			var srv *http.Server
 			g.Add(func() error {
-				_, err := ts.Up(ctx)
+				st, err := ts.Up(ctx)
 				if err != nil {
 					return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
 				}
+
 				srv = &http.Server{
 					TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-					Handler:   instrument(localTailnetTLSHandler(log, lc, proxy)),
+					Handler:   instrument(redirect(st.Self.DNSName, true, tailnet(log, lc, proxy))),
 				}
 
 				ln, err := ts.Listen("tcp", ":443")
@@ -295,23 +304,38 @@ func tsproxy(ctx context.Context) error {
 			}, func(_ error) {
 				if srv != nil {
 					if err := srv.Close(); err != nil {
-						log.Error("TLS server shutdown", lerr(err))
+						log.Error("server shutdown", lerr(err))
 					}
 				}
 				cancel()
 			})
 		}
-		if upstream.Funnel {
+		if funnel := upstream.Funnel; funnel != nil {
 			{
 				var srv *http.Server
 				g.Add(func() error {
-					_, err := ts.Up(ctx)
+					st, err := ts.Up(ctx)
 					if err != nil {
 						return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
 					}
-					srv = &http.Server{
-						Handler: instrument(insecureFunnelHandler(log, lc, proxy)),
+
+					var handler http.Handler
+					switch {
+					case funnel.Insecure:
+						handler = insecureFunnel(log, lc, proxy)
+					case funnel.Issuer != "":
+						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
+						wrapper, err := middleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
+						if err != nil {
+							return fmt.Errorf("oidc middleware for %s: %w", upstream.Name, err)
+						}
+						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile)
+
+						handler = wrapper.Wrap(oidcFunnel(log, lc, proxy))
+					default:
+						return fmt.Errorf("upstream %s must set funnel.insecure or funnel.issuer", upstream.Name)
 					}
+					srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, true, handler))}
 
 					ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
 					if err != nil {
@@ -321,7 +345,7 @@ func tsproxy(ctx context.Context) error {
 				}, func(_ error) {
 					if srv != nil {
 						if err := srv.Close(); err != nil {
-							log.Error("TLS server shutdown", lerr(err))
+							log.Error("server shutdown", lerr(err))
 						}
 					}
 					cancel()
@@ -333,13 +357,31 @@ func tsproxy(ctx context.Context) error {
 	return g.Run()
 }
 
-// localTailnetHandler serves plain-HTTP on the local tailnet.
-func localTailnetHandler(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
+func redirect(fqdn string, forceSSL bool, next http.Handler) http.Handler {
+	if fqdn == "" {
+		panic("redirect: fqdn cannot be empty")
+	}
+	fqdn = strings.TrimSuffix(fqdn, ".")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if forceSSL && r.TLS == nil {
+			http.Redirect(w, r, fmt.Sprintf("https://%s%s", fqdn, r.RequestURI), http.StatusPermanentRedirect)
+			return
+		}
+
+		if r.TLS != nil && strings.TrimSuffix(r.Host, ".") != fqdn {
+			http.Redirect(w, r, fmt.Sprintf("https://%s%s", fqdn, r.RequestURI), http.StatusPermanentRedirect)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func tailnet(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := tsWhoIs(lc, r)
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.Error("tailscale whois", lerr(err))
+			logger.ErrorContext(r.Context(), "tailscale whois", lerr(err))
 			return
 		}
 
@@ -356,46 +398,67 @@ func localTailnetHandler(logger *slog.Logger, lc tailscaleLocalClient, next http
 	})
 }
 
-// localTailnetTLSHandler serves HTTPS on the local tailnet.
-func localTailnetTLSHandler(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
-	var (
-		handler = localTailnetHandler(logger, lc, next)
-		dnsName string
-	)
+func insecureFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.TLS == nil {
-			panic("TLS handler wants TLS")
+		whois, err := tsWhoIs(lc, r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "tailscale whois", lerr(err))
+			return
 		}
-
-		if dnsName == "" {
-			st, err := lc.StatusWithoutPeers(r.Context())
-			if err != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				logger.Error("tailscale status", slog.Any("err", err))
-				return
-			}
-			dnsName = strings.TrimSuffix(st.Self.DNSName, ".")
-		}
-
-		if strings.TrimSuffix(r.Host, ".") != dnsName {
-			http.Redirect(w, r, fmt.Sprintf("https://%s%s", dnsName, r.RequestURI), http.StatusPermanentRedirect)
+		if !whois.Node.IsTagged() {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			logger.ErrorContext(r.Context(), "funnel handler got request from non-tagged node")
 			return
 		}
 
-		handler.ServeHTTP(w, r)
+		next.ServeHTTP(w, r)
 	})
 }
 
-// insecureFunnelHandler handles HTTPS requests coming from Tailscale Funnel nodes.
-// This is marked insecure because the upstream is exposed to the public Internet.
-// The upstream is responsible for implementing authentication.
-func insecureFunnelHandler(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
-	return localTailnetHandler(logger, lc, next)
+func oidcFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		whois, err := tsWhoIs(lc, r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "tailscale whois", lerr(err))
+			return
+		}
+		if !whois.Node.IsTagged() {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			logger.ErrorContext(r.Context(), "funnel handler got request from non-tagged node")
+			return
+		}
+
+		tok := middleware.IDJWTFromContext(r.Context())
+		if tok == nil {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			logger.ErrorContext(r.Context(), "jwt token missing")
+			return
+		}
+		email, err := tok.StringClaim("email")
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "claim missing", slog.String("claim", "email"))
+			return
+		}
+		name, err := tok.StringClaim("name")
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "claim missing", slog.String("claim", "name"))
+			return
+		}
+
+		req := r.Clone(r.Context())
+		req.Header.Set("X-Webauth-User", email)
+		req.Header.Set("X-Webauth-Name", name)
+
+		next.ServeHTTP(w, req)
+	})
 }
 
 type tailscaleLocalClient interface {
 	WhoIs(context.Context, string) (*apitype.WhoIsResponse, error)
-	StatusWithoutPeers(context.Context) (*ipnstate.Status, error)
 }
 
 func tsWhoIs(lc tailscaleLocalClient, r *http.Request) (*apitype.WhoIsResponse, error) {
@@ -443,5 +506,5 @@ func serveDiscovery(self string, targets []target) http.Handler {
 }
 
 func lerr(err error) slog.Attr {
-	return slog.String("err", err.Error())
+	return slog.Any("err", err)
 }

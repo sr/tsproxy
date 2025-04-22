@@ -8,165 +8,305 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
 
 type fakeLocalClient struct {
-	whois  func(context.Context, string) (*apitype.WhoIsResponse, error)
-	status func(context.Context) (*ipnstate.Status, error)
+	whois func(context.Context, string) (*apitype.WhoIsResponse, error)
 }
 
 func (c *fakeLocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
+	if c.whois == nil {
+		return nil, errors.New("not implemented")
+	}
 	return c.whois(ctx, remoteAddr)
 }
 
-func (c *fakeLocalClient) StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error) {
-	return c.status(ctx)
-}
-
-func TestLocalTailnetHandler(t *testing.T) {
+func TestTSHandlers(t *testing.T) {
 	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 
 	for _, tc := range []struct {
 		name        string
 		whois       func(context.Context, string) (*apitype.WhoIsResponse, error)
-		want        int
+		handler     func(*slog.Logger, tailscaleLocalClient, http.Handler) http.Handler
+		wantNext    bool
+		wantStatus  int
 		wantHeaders map[string]string
+		wantBody    string
 	}{
 		{
-			name: "tailscale whois error",
+			name:    "tailnet: tailscale whois error",
+			handler: tailnet,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return nil, errors.New("whois error")
 			},
-			want: http.StatusInternalServerError,
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
 		},
 		{
-			name: "tailscale whois no profile",
+			name:    "tailnet: tailscale whois no profile",
+			handler: tailnet,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
-				return &apitype.WhoIsResponse{}, nil
+				return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
 			},
-			want: http.StatusInternalServerError,
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
 		},
 		{
-			name: "tailscale whois no node",
+			name:    "tailnet: tailscale whois no node",
+			handler: tailnet,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login"}}, nil
 			},
-			want: http.StatusInternalServerError,
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
 		},
 		{
-			name: "tailscale whois ok (tagged node)",
+			name:    "tailnet: tailscale whois ok (tagged node)",
+			handler: tailnet,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
 			},
-			want: http.StatusOK,
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "",
+				"X-Webauth-Name": "",
+			},
 		},
 		{
-			name: "tailscale whois ok (user)",
+			name:    "tailnet: tailscale whois ok (user)",
+			handler: tailnet,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
 			},
-			want: http.StatusOK,
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
 			wantHeaders: map[string]string{
 				"X-Webauth-User": "login",
 				"X-Webauth-Name": "name",
 			},
 		},
+		{
+			name:    "insecure: tailscale whois error",
+			handler: insecureFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return nil, errors.New("whois error")
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "insecure: tailscale whois no profile",
+			handler: insecureFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "insure: tailscale whois no node",
+			handler: insecureFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login"}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "insecure: tagged node",
+			handler: insecureFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+			},
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "",
+				"X-Webauth-Name": "",
+			},
+		},
+		{
+			name:    "insecure: user node",
+			handler: insecureFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Unauthorized",
+		},
+		{
+			name:    "oidc: tailscale whois error",
+			handler: oidcFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return nil, errors.New("whois error")
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "oidc: tailscale whois no profile",
+			handler: oidcFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "oidc: tailscale whois no node",
+			handler: oidcFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login"}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name:    "oidc: user node",
+			handler: oidcFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Unauthorized",
+		},
+		{
+			name:    "oidc: tagged node",
+			handler: oidcFunnel,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantBody:   "Unauthorized",
+		},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			lc := &fakeLocalClient{whois: tc.whois}
-			be := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				for k, v := range r.Header {
-					w.Header().Set(k, v[0])
-				}
-				fmt.Fprintln(w, "Hi from the backend.")
-			})
-			px := httptest.NewServer(localTailnetHandler(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, be))
-			defer px.Close()
 
-			resp, err := http.Get(px.URL)
+			var nextReq *http.Request
+			h := tc.handler(logger, &fakeLocalClient{whois: tc.whois}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextReq = r
+				fmt.Fprintf(w, "OK")
+			}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://example.com/path", nil))
+			resp := w.Result()
+
+			if want, got := tc.wantStatus, resp.StatusCode; want != got {
+				t.Errorf("want status %d, got: %d", want, got)
+			}
+
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
-
-			if want, got := tc.want, resp.StatusCode; want != got {
-				t.Errorf("want status %d, got: %d", want, got)
+			if !strings.Contains(string(body), tc.wantBody) {
+				t.Errorf("want body %q, got: %q", tc.wantBody, string(body))
 			}
-			if tc.wantHeaders == nil {
-				tc.wantHeaders = map[string]string{
-					"X-Webauth-User": "",
-					"X-Webauth-Name": "",
-				}
+			if tc.wantNext && nextReq == nil {
+				t.Fatalf("next handler not called")
 			}
 			for k, want := range tc.wantHeaders {
-				if got := resp.Header.Get(k); got != want {
-					t.Errorf("want header %s %s, got: %s", k, want, got)
+				if got := nextReq.Header.Get(k); got != want {
+					t.Errorf("want header %s = %s, got: %s", k, want, got)
 				}
 			}
 		})
 	}
 }
 
-func TestLocalTailnetTLSHandler(t *testing.T) {
+func TestRedirectHandler(t *testing.T) {
 	t.Parallel()
 
-	lc := &fakeLocalClient{
-		whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
-			return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
+	for _, tc := range []struct {
+		name         string
+		forceSSL     bool
+		fqdn         string
+		request      *http.Request
+		wantNext     bool
+		wantStatus   int
+		wantLocation string
+	}{
+		{
+			name:         "forceSSL: redirect",
+			forceSSL:     true,
+			fqdn:         "http://example.com",
+			request:      httptest.NewRequest("", "/path", nil),
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.com/path",
 		},
-		status: func(_ context.Context) (*ipnstate.Status, error) {
-			return &ipnstate.Status{Self: &ipnstate.PeerStatus{DNSName: "foo.ts.net."}}, nil
+		{
+			name:       "forceSSL: ok",
+			forceSSL:   true,
+			fqdn:       "example.com",
+			request:    httptest.NewRequest("", "https://example.com/path", nil),
+			wantNext:   true,
+			wantStatus: http.StatusOK,
 		},
-	}
-	be := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hi from the backend.")
-	})
-	px := httptest.NewTLSServer(localTailnetTLSHandler(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{})), lc, be))
-	defer px.Close()
+		{
+			name:         "fqdn: redirect",
+			fqdn:         "example.ts.net",
+			request:      httptest.NewRequest("", "https://example/path", nil),
+			wantStatus:   http.StatusPermanentRedirect,
+			wantLocation: "https://example.ts.net/path",
+		},
+		{
+			name:       "fqdn: ok",
+			fqdn:       "example.ts.net",
+			request:    httptest.NewRequest("", "https://example.ts.net/path", nil),
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "fqdn: ok (not tls)",
+			fqdn:       "example.ts.net",
+			request:    httptest.NewRequest("", "/path", nil),
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	cli := px.Client()
-	cli.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
+			var nextReq *http.Request
+			h := redirect(tc.fqdn, tc.forceSSL, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextReq = r
+				fmt.Fprintf(w, "OK")
+			}))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, tc.request)
+			resp := w.Result()
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, px.URL+"/bar", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := cli.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if want, got := http.StatusPermanentRedirect, resp.StatusCode; want != got {
-		t.Fatalf("want status %d, got: %d", want, got)
-	}
-	if want, got := "https://foo.ts.net/bar", resp.Header.Get("location"); got != want {
-		t.Fatalf("want Location %s, got: %s", want, got)
-	}
+			if want, got := tc.wantStatus, resp.StatusCode; want != got {
+				t.Errorf("want status %d, got: %d", want, got)
+			}
 
-	req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, px.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Host = "foo.ts.net"
-	resp, err = px.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if want, got := http.StatusOK, resp.StatusCode; want != got {
-		t.Fatalf("want status %d, got: %d", want, got)
+			if tc.wantNext && nextReq == nil {
+				t.Fatalf("next handler not called")
+			}
+			if !tc.wantNext && nextReq != nil {
+				t.Fatalf("next handler was called")
+			}
+			if nextReq != nil {
+				if want, got := tc.wantLocation, nextReq.Header.Get("Location"); got != want {
+					t.Errorf("want Location header %s, got: %s", want, got)
+				}
+			}
+		})
 	}
 }
 
