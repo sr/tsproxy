@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -76,6 +77,8 @@ type funnelConfig struct {
 	Issuer       string
 	ClientID     string
 	ClientSecret string
+	User         string
+	Password     string
 }
 
 type target struct {
@@ -240,7 +243,7 @@ func tsproxy(ctx context.Context) error {
 		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-			logger.Error("upstream error", lerr(err))
+			log.Error("upstream error", lerr(err))
 		}
 
 		instrument := func(h http.Handler) http.Handler {
@@ -332,8 +335,17 @@ func tsproxy(ctx context.Context) error {
 						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile)
 
 						handler = wrapper.Wrap(oidcFunnel(log, lc, proxy))
+					case funnel.User != "":
+						if _, fn, ok := strings.Cut(funnel.Password, "file://"); ok {
+							data, err := os.ReadFile(fn)
+							if err != nil {
+								return fmt.Errorf("upstream %s: read password file %s: %w", upstream.Name, fn, err)
+							}
+							funnel.Password = strings.TrimSpace(string(data))
+						}
+						handler = insecureFunnel(log, lc, basicAuth(log, funnel.User, funnel.Password, proxy))
 					default:
-						return fmt.Errorf("upstream %s must set funnel.insecure or funnel.issuer", upstream.Name)
+						return fmt.Errorf("upstream %s: must set funnel.insecure or funnel.issuer", upstream.Name)
 					}
 					srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, true, handler))}
 
@@ -373,6 +385,26 @@ func redirect(fqdn string, forceSSL bool, next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func basicAuth(logger *slog.Logger, user, password string, next http.Handler) http.Handler {
+	if user == "" || password == "" {
+		panic("user and password are required")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if ok {
+			userCheck := subtle.ConstantTimeCompare([]byte(user), []byte(u))
+			passwordCheck := subtle.ConstantTimeCompare([]byte(password), []byte(p))
+			if userCheck == 1 && passwordCheck == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		logger.ErrorContext(r.Context(), "authentication failed", slog.String("user", u))
+		w.Header().Set("WWW-Authenticate", "Basic realm=\"protected\", charset=\"UTF-8\"")
+		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 	})
 }
 

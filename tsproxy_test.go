@@ -310,6 +310,77 @@ func TestRedirectHandler(t *testing.T) {
 	}
 }
 
+func TestBasicAuthHandler(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
+
+	for _, tc := range []struct {
+		name       string
+		user       string
+		password   string
+		request    func(*http.Request)
+		wantNext   bool
+		wantStatus int
+	}{
+		{
+			name:       "no basic auth provided",
+			user:       "admin",
+			password:   "secret",
+			request:    func(_ *http.Request) {},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "wrong user",
+			user:       "admin",
+			password:   "secret",
+			request:    func(r *http.Request) { r.SetBasicAuth("bad", "secret") },
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "wrong password",
+			user:       "admin",
+			password:   "secret",
+			request:    func(r *http.Request) { r.SetBasicAuth("admin", "bad") },
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "ok",
+			user:       "admin",
+			password:   "secret",
+			request:    func(r *http.Request) { r.SetBasicAuth("admin", "secret") },
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var nextReq *http.Request
+			h := basicAuth(logger, tc.user, tc.password, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextReq = r
+				fmt.Fprintf(w, "OK")
+			}))
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("", "/", nil)
+			tc.request(req)
+			h.ServeHTTP(w, req)
+			resp := w.Result()
+
+			if want, got := tc.wantStatus, resp.StatusCode; want != got {
+				t.Errorf("want status %d, got: %d", want, got)
+			}
+
+			if tc.wantNext && nextReq == nil {
+				t.Fatalf("next handler not called")
+			}
+			if !tc.wantNext && nextReq != nil {
+				t.Fatalf("next handler should not have been called")
+			}
+		})
+	}
+}
+
 func TestServeDiscovery(t *testing.T) {
 	t.Parallel()
 
