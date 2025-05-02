@@ -124,6 +124,7 @@ func tsproxy(ctx context.Context) error {
 		statedir    = flag.String("statedir", defaultStatedir, "path to the top-level state directory")
 		state       = flag.String("state", "", "leave empty to store state files in --statedir; use \"incus:socket\" to persist them as objects in an incus bucket")
 		addr        = flag.String("http", "", "optional [ip]:port for serving metrics and service discovery; use tailscale:port to listen on the node's tailscale IPs")
+		httpLog     = flag.Bool("http-log", false, "enable HTTP access log")
 		incusBucket = flag.String("incus-bucket", "", "incus bucket in the format storage-pool:bucket-name; required for --state=incus:socket")
 		ver         = flag.Bool("version", false, "print version information and exit")
 		aclTags     []string
@@ -417,6 +418,9 @@ func tsproxy(ctx context.Context) error {
 		}
 
 		instrument := func(h http.Handler) http.Handler {
+			if *httpLog {
+				h = httpAccessLogger(log, h)
+			}
 			return promhttp.InstrumentHandlerInFlight(
 				requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
 				promhttp.InstrumentHandlerDuration(
@@ -576,7 +580,12 @@ func tsproxy(ctx context.Context) error {
 					default:
 						return fmt.Errorf("upstream %s: must set funnel.insecure or funnel.issuer", upstream.Name)
 					}
-					srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, true, handler))}
+					srv = &http.Server{
+						Handler: instrument(redirect(st.Self.DNSName, true, handler)),
+						ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+							return context.WithValue(ctx, ctxConn{}, c)
+						},
+					}
 
 					ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
 					if err != nil {
@@ -943,4 +952,66 @@ func proxyCopy(errC chan<- error, src, dst net.Conn) {
 
 	_, err := io.Copy(src, dst)
 	errC <- err
+}
+
+// ctxConn is a key to look up a net.Conn stored in an HTTP request's context.
+type ctxConn struct{}
+
+func httpAccessLogger(logger *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// If the funneled connection is from tsnet, then the net.Conn will be of
+		// type ipn.FunnelConn.
+		netConn := r.Context().Value(ctxConn{})
+		// If the conn is wrapped inside TLS, unwrap it
+		if tlsConn, ok := netConn.(*tls.Conn); ok {
+			netConn = tlsConn.NetConn()
+		}
+		remote := r.RemoteAddr
+		if fconn, ok := netConn.(*ipn.FunnelConn); ok {
+			remote = fconn.Src.String()
+		}
+
+		wrapped := &responseWriter{ResponseWriter: w}
+		next.ServeHTTP(wrapped, r)
+
+		status := wrapped.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		logger.Info("http request",
+			slog.String("client", remote),
+			slog.String("proto", r.Proto),
+			slog.String("method", r.Method),
+			slog.String("host", r.Host),
+			slog.String("path", r.URL.Path),
+			slog.String("user_agent", r.UserAgent()),
+			slog.String("referer", r.Referer()),
+			slog.Int("status", status),
+			slog.Duration("timing_nanoseconds", time.Since(start)),
+			slog.Int("written_bytes", wrapped.bytesWritten),
+		)
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status       int
+	bytesWritten int
+}
+
+func (w *responseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytesWritten += n
+	return n, err
+}
+
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
