@@ -3,14 +3,6 @@ version: "2"
 run:
   modules-download-mode: readonly
 
-output:
-  formats:
-    text:
-      color: true
-      path: stdout
-
-linters-settings:
-
 linters:
   enable:
     - errcheck
@@ -35,9 +27,7 @@ linters:
       rules:
         - name: package-comments
           disabled: true
-    errcheck:
-      exclude-functions:
-        
+
 formatters:
   enable:
     - goimports
