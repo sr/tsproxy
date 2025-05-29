@@ -26,11 +26,9 @@ import (
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -140,7 +138,7 @@ func tsproxy(ctx context.Context) error {
 		listeners = append(listeners, ln)
 
 		http.Handle("/metrics", promhttp.Handler())
-		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
+		// http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`<html>
 				<head><title>tsproxy</title></head>
@@ -183,7 +181,6 @@ func tsproxy(ctx context.Context) error {
 		ts := &tsnet.Server{
 			Hostname:     upstream.Name,
 			Store:        stateStore,
-			Hostname:     upstream.name,
 			RunWebClient: true,
 		}
 		defer ts.Close()
