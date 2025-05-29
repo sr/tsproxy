@@ -15,8 +15,7 @@ const cookieName = "tsproxy-auth"
 
 var _ middleware.SessionStore
 
-type cookieAuthSession struct {
-}
+type cookieAuthSession struct{}
 
 func (cookieAuthSession) Get(r *http.Request) (*middleware.SessionData, error) {
 	c, err := r.Cookie(cookieName)
