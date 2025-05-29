@@ -336,15 +336,12 @@ func tsproxy(ctx context.Context) error {
 				if upstream.OIDCIssuer != "" {
 					baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
 
-					oidcm := &middleware.Handler{
-						Issuer:           upstream.OIDCIssuer,
-						ClientID:         upstream.OIDCClientID,
-						ClientSecret:     upstream.OIDCClientSecret,
-						BaseURL:          baseURL,
-						RedirectURL:      baseURL + "/.tsproxy/oidc-callback",
-						SessionStore:     &cookieAuthSession{},
-						AdditionalScopes: []string{"profile"}, // make sure we have email etc.
+					oidcm, err := middleware.NewFromDiscovery(ctx, nil, upstream.OIDCIssuer, upstream.OIDCClientID, upstream.OIDCClientSecret, baseURL+"/.tsproxy/oidc-callback")
+					if err != nil {
+						return fmt.Errorf("oidc: new middleware: %w", err)
 					}
+					oidcm.OAuth2Config.Scopes = append(oidcm.OAuth2Config.Scopes, "profile", "email")
+
 					mux.Handle("/", oidcm.Wrap(rp)) // fallback to authed path.
 				} else if !slices.Contains(upstream.FunnelPublicPatterns, "/") {
 					// no OIDC auth, no root pattern, default behaviour is to block.
@@ -418,18 +415,21 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 		displayName := whois.UserProfile.DisplayName
 
 		if isFunnel {
-			cl := middleware.ClaimsFromContext(r.Context())
-			if cl != nil {
-				email := cl.Extra["email"].(string)
-				name := cl.Extra["name"].(string)
-				if email == "" || name == "" {
-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					logger.Error("oidc id token missing name or email", slog.String("email", email), slog.String("name", name))
-					return
-				}
-				loginName = email
-				displayName = name
+			idt := middleware.IDJWTFromContext(r.Context())
+			if idt == nil || !idt.HasStringClaim("name") || !idt.HasStringClaim("email") {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				logger.Error("oidc id token missing name or email")
+				return
 			}
+			email, eerr := idt.StringClaim("email")
+			name, nerr := idt.StringClaim("name")
+			if eerr != nil || nerr != nil {
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				logger.Error("oidc id token cannot unpack name or email", "eerr", eerr, "nerr", nerr)
+				return
+			}
+			loginName = email
+			displayName = name
 		}
 
 		req := r.Clone(r.Context())
