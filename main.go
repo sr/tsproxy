@@ -23,11 +23,14 @@ import (
 	"github.com/lstoll/oidc/middleware"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -94,6 +97,7 @@ func tsproxy(ctx context.Context) error {
 	if len(cfg.Upstreams) == 0 {
 		return fmt.Errorf("required flag missing: upstream")
 	}
+	prometheus.MustRegister(versioncollector.NewCollector("tsproxy"))
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
@@ -136,8 +140,8 @@ func tsproxy(ctx context.Context) error {
 		listeners = append(listeners, ln)
 
 		http.Handle("/metrics", promhttp.Handler())
-		//http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
+		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`<html>
 				<head><title>tsproxy</title></head>
 				<body>
@@ -154,7 +158,7 @@ func tsproxy(ctx context.Context) error {
 			g.Add(func() error {
 				logger.Info("server ready", slog.String("addr", ln.Addr().String()))
 				return srv.Serve(ln)
-			}, func(err error) {
+			}, func(_ error) {
 				if err := srv.Close(); err != nil {
 					logger.Error("shutdown server", lerr(err))
 				}
@@ -177,13 +181,16 @@ func tsproxy(ctx context.Context) error {
 		}
 
 		ts := &tsnet.Server{
-			Hostname: upstream.Name,
-			Store:    stateStore,
+			Hostname:     upstream.Name,
+			Store:        stateStore,
+			Hostname:     upstream.name,
+			RunWebClient: true,
 		}
 		defer ts.Close()
 
 		if cfg.LogTailscale {
 			ts.Logf = func(format string, args ...any) {
+				//nolint: sloglint
 				log.Info(fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
 			}
 		} else {
@@ -375,7 +382,7 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 			req.Out.Host = req.In.Host
 		},
 	}
-	rproxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+	rproxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		logger.Error("upstream error", lerr(err))
 	}
@@ -436,7 +443,7 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 }
 
 func serveDiscovery(self string, targets []target) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var tgs []string
 		tgs = append(tgs, self)
 		for _, t := range targets {

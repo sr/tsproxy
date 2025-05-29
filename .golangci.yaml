@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  modules-download-mode: readonly
+
+output:
+  formats:
+    text:
+      color: true
+      path: stdout
+
+linters-settings:
+
+linters:
+  enable:
+    - errcheck
+    - revive
+    - govet
+    - misspell
+    - unused
+    - unparam
+    - staticcheck
+    - nilerr
+    - usetesting
+    - thelper
+    - bodyclose
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+  settings:
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true
+    errcheck:
+      exclude-functions:
+        
+formatters:
+  enable:
+    - goimports
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true
