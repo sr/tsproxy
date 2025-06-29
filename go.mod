@@ -10,7 +10,6 @@ require (
 	github.com/oklog/run v1.1.0
 	github.com/prometheus/client_golang v1.21.1
 	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a
-	golang.org/x/oauth2 v0.30.0
 	k8s.io/api v0.32.0
 	k8s.io/apimachinery v0.32.0
 	k8s.io/client-go v0.32.0
@@ -103,6 +102,7 @@ require (
 	golang.org/x/exp v0.0.0-20250210185358-939b2ce775ac // indirect
 	golang.org/x/mod v0.25.0 // indirect
 	golang.org/x/net v0.40.0 // indirect
+	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/term v0.32.0 // indirect
