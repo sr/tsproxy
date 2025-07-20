@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lstoll/oidc/middleware"
+	"github.com/lstoll/oauth2ext/oidcmiddleware"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -336,7 +336,7 @@ func tsproxy(ctx context.Context) error {
 				if upstream.OIDCIssuer != "" {
 					baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
 
-					oidcm, err := middleware.NewFromDiscovery(ctx, nil, upstream.OIDCIssuer, upstream.OIDCClientID, upstream.OIDCClientSecret, baseURL+"/.tsproxy/oidc-callback")
+					oidcm, err := oidcmiddleware.NewFromDiscovery(ctx, nil, upstream.OIDCIssuer, upstream.OIDCClientID, upstream.OIDCClientSecret, baseURL+"/.tsproxy/oidc-callback")
 					if err != nil {
 						return fmt.Errorf("oidc: new middleware: %w", err)
 					}
@@ -417,9 +417,9 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 		)
 
 		if isFunnel {
-			idt := middleware.IDJWTFromContext(r.Context())
+			idt, ok := oidcmiddleware.IDJWTFromContext(r.Context())
 			// only if present, i.e for non-public paths.
-			if idt != nil {
+			if ok {
 				if !idt.HasStringClaim("name") || !idt.HasStringClaim("email") {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 					logger.Error("oidc id token missing name or email")
