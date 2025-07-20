@@ -411,30 +411,42 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 			return
 		}
 
-		loginName := whois.UserProfile.LoginName
-		displayName := whois.UserProfile.DisplayName
+		var (
+			loginName   string
+			displayName string
+		)
 
 		if isFunnel {
 			idt := middleware.IDJWTFromContext(r.Context())
-			if idt == nil || !idt.HasStringClaim("name") || !idt.HasStringClaim("email") {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				logger.Error("oidc id token missing name or email")
-				return
+			// only if present, i.e for non-public paths.
+			if idt != nil {
+				if !idt.HasStringClaim("name") || !idt.HasStringClaim("email") {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					logger.Error("oidc id token missing name or email")
+					return
+				}
+				email, eerr := idt.StringClaim("email")
+				name, nerr := idt.StringClaim("name")
+				if eerr != nil || nerr != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					logger.Error("oidc id token cannot unpack name or email", "eerr", eerr, "nerr", nerr)
+					return
+				}
+				loginName = email
+				displayName = name
 			}
-			email, eerr := idt.StringClaim("email")
-			name, nerr := idt.StringClaim("name")
-			if eerr != nil || nerr != nil {
-				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-				logger.Error("oidc id token cannot unpack name or email", "eerr", eerr, "nerr", nerr)
-				return
-			}
-			loginName = email
-			displayName = name
+		} else {
+			loginName = whois.UserProfile.LoginName
+			displayName = whois.UserProfile.DisplayName
 		}
 
 		req := r.Clone(r.Context())
-		req.Header.Set("X-Webauth-User", loginName)
-		req.Header.Set("X-Webauth-Name", displayName)
+		if loginName != "" {
+			req.Header.Set("X-Webauth-User", loginName)
+		}
+		if displayName != "" {
+			req.Header.Set("X-Webauth-Name", displayName)
+		}
 		rproxy.ServeHTTP(w, req)
 	})
 }
