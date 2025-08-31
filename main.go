@@ -417,19 +417,14 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 		)
 
 		if isFunnel {
-			idt, ok := oidcmiddleware.IDJWTFromContext(r.Context())
+			idt, ok := oidcmiddleware.IDClaimsFromContext(r.Context())
 			// only if present, i.e for non-public paths.
 			if ok {
-				if !idt.HasStringClaim("name") || !idt.HasStringClaim("email") {
+				email, eok := idt.Extra["email"].(string)
+				name, nok := idt.Extra["name"].(string)
+				if !eok || !nok {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					logger.Error("oidc id token missing name or email")
-					return
-				}
-				email, eerr := idt.StringClaim("email")
-				name, nerr := idt.StringClaim("name")
-				if eerr != nil || nerr != nil {
-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					logger.Error("oidc id token cannot unpack name or email", "eerr", eerr, "nerr", nerr)
+					logger.Error("oidc id token missing name and email")
 					return
 				}
 				loginName = email
