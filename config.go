@@ -54,6 +54,13 @@ type upstream struct {
 	OIDCClientID string `json:"oidcClientID"`
 	// OIDCClientSecret sets the OIDC client secret
 	OIDCClientSecret string `json:"oidcClientSecret"`
+
+	// OIDCRegisterClient enables auto-registration of the OIDC client the
+	// issuer. If used, the client id and client secret are ignored.
+	OIDCRegisterClient bool `json:"oidcRegisterClient"`
+	// OIDCRequireGroups requires the user to be in one of the groups listed in
+	// the OIDC groups claim. This will automatically add the `groups` scope.
+	OIDCRequireGroups []string `json:"oidcRequireGroups"`
 }
 
 type kubernetesConfig struct {
@@ -103,10 +110,10 @@ func parseAndValidateConfig(cfg []byte) (config, error) {
 		}
 
 		if u.OIDCIssuer != "" {
-			if u.OIDCClientID == "" {
+			if u.OIDCClientID == "" && !u.OIDCRegisterClient {
 				verr = errors.Join(verr, fmt.Errorf("upstream %s oidcClientID required", u.Name))
 			}
-			if u.OIDCClientSecret == "" {
+			if u.OIDCClientSecret == "" && !u.OIDCRegisterClient {
 				verr = errors.Join(verr, fmt.Errorf("upstream %s oidcClientSecret required", u.Name))
 			}
 		}

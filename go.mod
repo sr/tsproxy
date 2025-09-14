@@ -10,7 +10,7 @@ require (
 	k8s.io/api v0.34.1
 	k8s.io/apimachinery v0.34.1
 	k8s.io/client-go v0.34.1
-	lds.li/oauth2ext v0.0.0-20250914000806-c3b2c2b5b83a
+	lds.li/oauth2ext v0.0.0-20250914133403-f15f6850f142
 	tailscale.com v1.88.1
 )
 

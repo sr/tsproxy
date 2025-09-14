@@ -329,20 +329,19 @@ func tsproxy(ctx context.Context) error {
 				// TODO pass public paths direct to the proxy
 				mux := http.NewServeMux()
 
+				// process these first, so they take precedence over the OIDC
+				// auth.
 				for _, p := range upstream.FunnelPublicPatterns {
 					mux.Handle(p, rp)
 				}
 
 				if upstream.OIDCIssuer != "" {
-					baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
-
-					oidcm, err := oidcmiddleware.NewFromDiscovery(ctx, nil, upstream.OIDCIssuer, upstream.OIDCClientID, upstream.OIDCClientSecret, baseURL+"/.tsproxy/oidc-callback")
+					mw, err := buildMiddlewareForUpstream(ctx, st, upstream)
 					if err != nil {
-						return fmt.Errorf("oidc: new middleware: %w", err)
+						return fmt.Errorf("oidc: build middleware: %w", err)
 					}
-					oidcm.OAuth2Config.Scopes = append(oidcm.OAuth2Config.Scopes, "profile", "email")
 
-					mux.Handle("/", oidcm.Wrap(rp)) // fallback to authed path.
+					mux.Handle("/", mw(rp)) // fallback to authed path.
 				} else if !slices.Contains(upstream.FunnelPublicPatterns, "/") {
 					// no OIDC auth, no root pattern, default behaviour is to block.
 					mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
