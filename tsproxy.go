@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,12 +18,15 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/lstoll/oidc"
 	"github.com/lstoll/oidc/middleware"
+	incus "github.com/lxc/incus/v6/client"
+	"github.com/lxc/incus/v6/shared/api"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
@@ -31,8 +36,9 @@ import (
 	"github.com/tailscale/hujson"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tsnet"
-	tslogger "tailscale.com/types/logger"
 )
 
 var (
@@ -95,12 +101,18 @@ func main() {
 }
 
 func tsproxy(ctx context.Context) error {
+	var defaultStatedir string
+	if dir, err := os.UserCacheDir(); err == nil {
+		defaultStatedir = filepath.Join(dir, "tsproxy")
+	}
+
 	var (
-		state  = flag.String("state", "", "Optional directory for storing Tailscale state.")
-		tslog  = flag.Bool("tslog", false, "If true, log Tailscale output.")
-		port   = flag.Int("port", 32019, "HTTP port for metrics and service discovery.")
-		ver    = flag.Bool("version", false, "print the version and exit")
-		upfile = flag.String("upstream", "", "path to upstreams config file")
+		upsfile     = flag.String("upstream", "", "path to JSON file containing the list of upstream(s) and their settings")
+		statedir    = flag.String("statedir", defaultStatedir, "path to the top-level state directory")
+		state       = flag.String("state", "", "leave empty to store state files in --statedir; use \"incus:socket\" to persist them as objects in an incus bucket")
+		addr        = flag.String("http", "", "optional [ip]:port for serving metrics and service discovery; use tailscale:port to listen on the node's tailscale IPs")
+		incusBucket = flag.String("incus-bucket", "", "incus bucket in the format storage-pool:bucket-name; required for --state=incus:socket")
+		ver         = flag.Bool("version", false, "print version information and exit")
 	)
 	flag.Parse()
 
@@ -109,50 +121,87 @@ func tsproxy(ctx context.Context) error {
 		os.Exit(0)
 	}
 
-	if *upfile == "" {
-		return fmt.Errorf("required flag missing: upstream")
+	if *upsfile == "" {
+		return fmt.Errorf("required flag missing: --upstream")
 	}
-
-	in, err := os.ReadFile(*upfile)
+	in, err := os.ReadFile(*upsfile)
 	if err != nil {
 		return err
 	}
 	inJSON, err := hujson.Standardize(in)
 	if err != nil {
-		return fmt.Errorf("hujson: %w", err)
+		return fmt.Errorf("decode --upstream file: %w", err)
 	}
 	var upstreams []upstream
 	if err := json.Unmarshal(inJSON, &upstreams); err != nil {
-		return fmt.Errorf("json: %w", err)
-	}
-	if len(upstreams) == 0 {
-		return fmt.Errorf("file does not contain any upstreams: %s", *upfile)
+		return fmt.Errorf("decode --upstream file: %w", err)
 	}
 
-	if *state == "" {
-		v, err := os.UserCacheDir()
+	if *statedir == "" {
+		return fmt.Errorf("required flag missing: --statedir")
+	}
+	if err := os.MkdirAll(*statedir, 0o700); err != nil {
+		return err
+	}
+
+	var (
+		minioClient *minio.Client
+		bucketName  string
+	)
+	switch *state {
+	case "incus:socket":
+		if *incusBucket == "" {
+			return errors.New("--incus-bucket is required for --state=incus")
+		}
+		pool, bucket, ok := strings.Cut(*incusBucket, ":")
+		if !ok {
+			return errors.New("--incus-bucket is invalid; use storage-pool:bucket-name format")
+		}
+		bucketName = bucket
+
+		cli, err := incus.ConnectIncusUnixWithContext(ctx, "", nil)
+		if err != nil {
+			return fmt.Errorf("incus: connect to unix socket: %w", err)
+		}
+
+		serv, _, err := cli.GetServer()
 		if err != nil {
 			return err
 		}
-		dir := filepath.Join(v, "tsproxy")
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
+		addr, ok := serv.Config["core.storage_buckets_address"]
+		if !ok {
+			return errors.New("incus: server config option not set: core.storage_buckets_address")
 		}
-		state = &dir
+
+		keys, err := cli.GetStoragePoolBucketKeys(pool, bucket)
+		if err != nil {
+			return fmt.Errorf("incus: get access keys for bucket %s: %w", bucket, err)
+		}
+		var adminKey api.StorageBucketKey
+		for _, k := range keys {
+			if k.Role == "admin" {
+				adminKey = k
+				break
+			}
+		}
+		if adminKey.Name == "" {
+			return fmt.Errorf("incus: no admin key found for bucket %s", bucket)
+		}
+		minioClient, err = minio.New(addr, &minio.Options{
+			Creds:  credentials.NewStaticV4(adminKey.AccessKey, adminKey.SecretKey, ""),
+			Secure: true,
+		})
+		if err != nil {
+			return fmt.Errorf("incus: connect to storage bucket endpoint %s: %w", addr, err)
+		}
+	case "":
+		// noop but valid
+	default:
+		return fmt.Errorf("--state=%s is not supported", *state)
 	}
-	prometheus.MustRegister(versioncollector.NewCollector("tsproxy"))
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
-
-	// If tailscaled isn't ready yet, just crash.
-	st, err := (&local.Client{}).Status(ctx)
-	if err != nil {
-		return fmt.Errorf("tailscale: get node status: %w", err)
-	}
-	if v := len(st.Self.TailscaleIPs); v != 2 {
-		return fmt.Errorf("want 2 tailscale IPs, got %d", v)
-	}
 
 	// service discovery targets (self + all upstreams)
 	targets := make([]target, len(upstreams)+1)
@@ -162,34 +211,56 @@ func tsproxy(ctx context.Context) error {
 	defer cancel()
 	g.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
 
-	{
-		p := strconv.Itoa(*port)
+	if *addr != "" {
+		host, port, err := net.SplitHostPort(*addr)
+		if err != nil {
+			return fmt.Errorf("parse --http flag: %w", err)
+		}
+
+		prometheus.MustRegister(versioncollector.NewCollector("tsproxy"))
+
+		http.Handle("/metrics", promhttp.Handler())
+		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`<html>
+					<head><title>tsproxy</title></head>
+					<body>
+					<h1>tsproxy</h1>
+					<p><a href="/metrics">Metrics</a></p>
+					<p><a href="/sd">Discovery</a></p>
+					</body>
+					</html>`))
+		})
 
 		var listeners []net.Listener
-		for _, ip := range st.Self.TailscaleIPs {
-			ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), p))
+		if host == "tailscale" {
+			st, err := (&local.Client{}).Status(ctx)
 			if err != nil {
-				return fmt.Errorf("listen on %s:%d: %w", ip, *port, err)
+				return fmt.Errorf("tailscale: get node status: %w", err)
+			}
+			if v := len(st.Self.TailscaleIPs); v != 2 {
+				return fmt.Errorf("want 2 tailscale IPs, got %d", v)
+			}
+			for _, ip := range st.Self.TailscaleIPs {
+				ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), port))
+				if err != nil {
+					return fmt.Errorf("listen on %s:%s: %w", ip, port, err)
+				}
+				listeners = append(listeners, ln)
+			}
+
+			http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, port), targets))
+		} else {
+			http.Handle("/sd", serveDiscovery(*addr, targets))
+
+			ln, err := net.Listen("tcp", *addr)
+			if err != nil {
+				return fmt.Errorf("listen on %s: %w", *addr, err)
 			}
 			listeners = append(listeners, ln)
 		}
 
-		http.Handle("/metrics", promhttp.Handler())
-		http.Handle("/sd", serveDiscovery(net.JoinHostPort(st.Self.DNSName, p), targets))
-		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte(`<html>
-				<head><title>tsproxy</title></head>
-				<body>
-				<h1>tsproxy</h1>
-				<p><a href="/metrics">Metrics</a></p>
-				<p><a href="/sd">Discovery</a></p>
-				</body>
-				</html>`))
-		})
-
 		srv := &http.Server{}
 		for _, ln := range listeners {
-			ln := ln
 			g.Add(func() error {
 				logger.Info("server ready", slog.String("addr", ln.Addr().String()))
 				return srv.Serve(ln)
@@ -207,22 +278,20 @@ func tsproxy(ctx context.Context) error {
 
 		ts := &tsnet.Server{
 			Hostname:     upstream.Name,
-			Dir:          filepath.Join(*state, "tailscale-"+upstream.Name),
 			RunWebClient: true,
+			UserLogf: func(format string, args ...any) {
+				log.Info("tailscale", slog.String("msg", fmt.Sprintf(format, args...)))
+			},
+			Dir: filepath.Join(*statedir, "tailscale-"+upstream.Name),
+		}
+		if *state == "incus:socket" {
+			st, err := newIncusStore(minioClient, bucketName, upstream)
+			if err != nil {
+				return fmt.Errorf("initialize incus state store for upstream %s: %w", upstream.Name, err)
+			}
+			ts.Store = st
 		}
 		defer ts.Close()
-
-		if *tslog {
-			ts.Logf = func(format string, args ...any) {
-				//nolint: sloglint
-				log.Info(fmt.Sprintf(format, args...), slog.String("logger", "tailscale"))
-			}
-		} else {
-			ts.Logf = tslogger.Discard
-		}
-		if err := os.MkdirAll(ts.Dir, 0o700); err != nil {
-			return err
-		}
 
 		lc, err := ts.LocalClient()
 		if err != nil {
@@ -539,4 +608,62 @@ func serveDiscovery(self string, targets []target) http.Handler {
 
 func lerr(err error) slog.Attr {
 	return slog.Any("err", err)
+}
+
+type incusStore struct {
+	cache  mem.Store
+	client *minio.Client
+	bucket string
+	object string
+}
+
+func newIncusStore(client *minio.Client, bucket string, up upstream) (ipn.StateStore, error) {
+	store := &incusStore{
+		client: client,
+		bucket: bucket,
+		object: "tailscale-" + up.Name,
+	}
+
+	obj, err := client.GetObject(context.TODO(), store.bucket, store.object, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("incus: get object %s in %s: %w", store.object, store.bucket, err)
+	}
+	defer obj.Close()
+
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.StatusCode == http.StatusNotFound {
+			data = []byte("{}")
+		} else {
+			return nil, fmt.Errorf("incus: read object %s in %s: %w", store.object, store.bucket, err)
+		}
+	}
+
+	if err := store.cache.LoadFromJSON(data); err != nil {
+		return nil, fmt.Errorf("incus: load state in memory: %w", err)
+	}
+
+	return store, nil
+}
+
+// ReadState implements the ipn.Store interface.
+func (s *incusStore) ReadState(id ipn.StateKey) ([]byte, error) {
+	return s.cache.ReadState(id)
+}
+
+// WriteState implements the ipn.Store interface.
+func (s *incusStore) WriteState(id ipn.StateKey, bs []byte) error {
+	if err := s.cache.WriteState(id, bs); err != nil {
+		return err
+	}
+	data, err := s.cache.ExportToJSON()
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutObject(context.TODO(), s.bucket, s.object, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/json"})
+	if err != nil {
+		return fmt.Errorf("incus: put object %s in bucket %s: %w", s.object, s.bucket, err)
+	}
+	return nil
 }

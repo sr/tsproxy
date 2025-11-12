@@ -1,0 +1,20 @@
+[
+  {"name": "example", "backend": "http://127.0.0.1:8000"},
+  {
+    "name": "example-basic",
+    "backend": "http://127.0.0.1:8000",
+    "funnel": {
+      "user": "admin",
+      "password": "password",
+    },
+  },
+  {
+    "name": "example-oidc",
+    "backend": "http://127.0.0.1:8000",
+    "funnel": {
+      "issuer": "http://id-staging.aux1.dev",
+      "clientID": "client-id",
+      "clientSecret": "client-secret",
+    },
+  },
+]
