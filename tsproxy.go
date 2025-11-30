@@ -21,8 +21,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/lstoll/oidc"
-	"github.com/lstoll/oidc/middleware"
 	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/minio/minio-go/v7"
@@ -34,6 +32,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
 	"github.com/tailscale/hujson"
+	"lds.li/oauth2ext/oidc"
+	"lds.li/oauth2ext/oidcmiddleware"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
@@ -397,7 +397,7 @@ func tsproxy(ctx context.Context) error {
 						handler = insecureFunnel(log, lc, proxy)
 					case funnel.Issuer != "":
 						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
-						wrapper, err := middleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
+						wrapper, err := oidcmiddleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
 						if err != nil {
 							return fmt.Errorf("oidc middleware for %s: %w", upstream.Name, err)
 						}
@@ -531,22 +531,22 @@ func oidcFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler)
 			return
 		}
 
-		tok := middleware.IDJWTFromContext(r.Context())
-		if tok == nil {
+		tok, ok := oidcmiddleware.IDClaimsFromContext(r.Context())
+		if !ok || tok == nil {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-			logger.ErrorContext(r.Context(), "jwt token missing")
+			logger.ErrorContext(r.Context(), "no verified oidc token found")
 			return
 		}
 		email, err := tok.StringClaim("email")
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.ErrorContext(r.Context(), "claim missing", slog.String("claim", "email"))
+			logger.ErrorContext(r.Context(), "oidc claim missing", slog.String("claim", "email"))
 			return
 		}
 		name, err := tok.StringClaim("name")
 		if err != nil {
 			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.ErrorContext(r.Context(), "claim missing", slog.String("claim", "name"))
+			logger.ErrorContext(r.Context(), "oidc claim missing", slog.String("claim", "name"))
 			return
 		}
 

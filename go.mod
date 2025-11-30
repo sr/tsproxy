@@ -4,13 +4,13 @@ go 1.25.5
 
 require (
 	github.com/google/go-cmp v0.7.0
-	github.com/lstoll/oidc v1.0.0-beta.4.0.20250106123456-6ffce62670fe
 	github.com/lxc/incus/v6 v6.19.1
 	github.com/minio/minio-go/v7 v7.0.97
 	github.com/oklog/run v1.1.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.67.4
 	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a
+	lds.li/oauth2ext v0.0.0-20251204000024-beb77293370f
 	tailscale.com v1.92.1
 )
 
@@ -84,7 +84,7 @@ require (
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wireguard-go v0.0.0-20250716170648-1d0488a3d7da // indirect
-	github.com/tink-crypto/tink-go/v2 v2.2.0 // indirect
+	github.com/tink-crypto/tink-go/v2 v2.5.0 // indirect
 	github.com/tinylib/msgp v1.5.0 // indirect
 	github.com/urfave/cli v1.22.17 // indirect
 	github.com/vbatts/go-mtree v0.6.1-0.20250911112631-8307d76bc1b9 // indirect
