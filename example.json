@@ -1,5 +1,6 @@
 [
   {"name": "example", "backend": "http://127.0.0.1:8000"},
+  {"name": "example-socket", "backend": "unix:///tmp/server.sock"},
   {
     "name": "example-basic",
     "backend": "http://127.0.0.1:8000",

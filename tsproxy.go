@@ -305,7 +305,11 @@ func tsproxy(ctx context.Context) error {
 		// TODO(sr) Instrument proxy.Transport
 		proxy := &httputil.ReverseProxy{
 			Rewrite: func(req *httputil.ProxyRequest) {
-				req.SetURL(backendURL)
+				if backendURL.Scheme == "unix" {
+					req.SetURL(&url.URL{Scheme: "http", Host: "unix", Path: "/"})
+				} else {
+					req.SetURL(backendURL)
+				}
 				req.SetXForwarded()
 				req.Out.Host = req.In.Host
 			},
@@ -313,6 +317,28 @@ func tsproxy(ctx context.Context) error {
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 			log.Error("upstream error", lerr(err))
+		}
+
+		switch backendURL.Scheme {
+		case "unix":
+			proxy.Transport = &http.Transport{
+				DisableKeepAlives: true,
+				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+					raddr, err := net.ResolveUnixAddr("unix", backendURL.Path)
+					if err != nil {
+						return nil, fmt.Errorf("resolve unix addr: %w", err)
+					}
+					conn, err := net.DialUnix("unix", nil, raddr)
+					if err != nil {
+						return nil, fmt.Errorf("dial unix: %w", err)
+					}
+					return conn, err
+				},
+			}
+		case "http", "https":
+			// noop
+		default:
+			return fmt.Errorf("upstream %s: cannot proxy to backend: %s", upstream.Name, backendURL)
 		}
 
 		instrument := func(h http.Handler) http.Handler {
