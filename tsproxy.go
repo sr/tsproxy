@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -113,7 +114,15 @@ func tsproxy(ctx context.Context) error {
 		addr        = flag.String("http", "", "optional [ip]:port for serving metrics and service discovery; use tailscale:port to listen on the node's tailscale IPs")
 		incusBucket = flag.String("incus-bucket", "", "incus bucket in the format storage-pool:bucket-name; required for --state=incus:socket")
 		ver         = flag.Bool("version", false, "print version information and exit")
+		aclTags     []string
+		authKeyFile = flag.String("authkey-file", "", "optional path to file from which the auth key should be read from; takes precedence over TS_AUTHKEY if set")
 	)
+	flag.Func("acl-tag", "ACL tag to advertise; required when TS_AUTHKEY is an oauth client secret (can be repeated)", func(s string) error {
+		if !slices.Contains(aclTags, s) {
+			aclTags = append(aclTags, s)
+		}
+		return nil
+	})
 	flag.Parse()
 
 	if *ver {
@@ -142,6 +151,20 @@ func tsproxy(ctx context.Context) error {
 	}
 	if err := os.MkdirAll(*statedir, 0o700); err != nil {
 		return err
+	}
+
+	var authKey string
+	if *authKeyFile != "" {
+		data, err := os.ReadFile(*authKeyFile)
+		if err != nil {
+			return fmt.Errorf("read -authkey-file: %w", err)
+		}
+		// ephemeral is true by default, this sets it to false unless the key
+		// contains a query string; that's a more suitable default for tsproxy.
+		authKey = strings.TrimSpace(string(data))
+		if !strings.Contains(authKey, "?") {
+			authKey += "?ephemeral=false"
+		}
 	}
 
 	var (
@@ -282,7 +305,9 @@ func tsproxy(ctx context.Context) error {
 			UserLogf: func(format string, args ...any) {
 				log.Info("tailscale", slog.String("msg", fmt.Sprintf(format, args...)))
 			},
-			Dir: filepath.Join(*statedir, "tailscale-"+upstream.Name),
+			Dir:           filepath.Join(*statedir, "tailscale-"+upstream.Name),
+			AdvertiseTags: aclTags,
+			AuthKey:       authKey,
 		}
 		if *state == "incus:socket" {
 			st, err := newIncusStore(minioClient, bucketName, upstream)
