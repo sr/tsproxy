@@ -1,19 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/vm"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/tailscale/hujson"
+	"github.com/tink-crypto/tink-go/v2/jwt"
+	"github.com/tink-crypto/tink-go/v2/keyset"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
@@ -32,12 +42,13 @@ func (c *fakeLocalClient) WhoIs(ctx context.Context, remoteAddr string) (*apityp
 func TestTSHandlers(t *testing.T) {
 	t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
+	logger := slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{}))
 
 	for _, tc := range []struct {
 		name        string
 		whois       func(context.Context, string) (*apitype.WhoIsResponse, error)
-		handler     func(*slog.Logger, tailscaleLocalClient, http.Handler) http.Handler
+		handler     func(*slog.Logger, tailscaleLocalClient, *vm.Program, http.Handler) http.Handler
+		expr        string
 		wantNext    bool
 		wantStatus  int
 		wantHeaders map[string]string
@@ -85,8 +96,38 @@ func TestTSHandlers(t *testing.T) {
 			},
 		},
 		{
-			name:    "tailnet: tailscale whois ok (user)",
+			name:    "tailnet: tailscale whois ok (user, no expr)",
 			handler: tailnet,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
+			},
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "",
+				"X-Webauth-Name": "",
+			},
+		},
+		{
+			name:    "tailnet: tailscale whois ok (user, expr set)",
+			handler: tailnet,
+			expr:    `{user: "user", name: "name"}`,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
+			},
+			wantNext:   true,
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "user",
+				"X-Webauth-Name": "name",
+			},
+		},
+		{
+			name:    "tailnet: tailscale whois ok (user, expr set, vars)",
+			handler: tailnet,
+			expr:    `{user: tailscale.LoginName, name: tailscale.DisplayName}`,
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
 			},
@@ -97,6 +138,16 @@ func TestTSHandlers(t *testing.T) {
 				"X-Webauth-User": "login",
 				"X-Webauth-Name": "name",
 			},
+		},
+		{
+			name:    "tailnet: tailscale whois ok (user, bad expr)",
+			handler: tailnet,
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
+			},
+			expr:       `{user: false}`,
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
 		},
 		{
 			name:    "insecure: tailscale whois error",
@@ -149,8 +200,10 @@ func TestTSHandlers(t *testing.T) {
 			wantBody:   "Unauthorized",
 		},
 		{
-			name:    "oidc: tailscale whois error",
-			handler: oidcFunnel,
+			name: "oidc: tailscale whois error",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				return oidcFunnel(logger, lc, nil, prog, next)
+			},
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return nil, errors.New("whois error")
 			},
@@ -158,8 +211,10 @@ func TestTSHandlers(t *testing.T) {
 			wantBody:   "Internal Server Error",
 		},
 		{
-			name:    "oidc: tailscale whois no profile",
-			handler: oidcFunnel,
+			name: "oidc: tailscale whois no profile",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				return oidcFunnel(logger, lc, nil, prog, next)
+			},
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"foo"}}}, nil
 			},
@@ -167,8 +222,10 @@ func TestTSHandlers(t *testing.T) {
 			wantBody:   "Internal Server Error",
 		},
 		{
-			name:    "oidc: tailscale whois no node",
-			handler: oidcFunnel,
+			name: "oidc: tailscale whois no node",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				return oidcFunnel(logger, lc, nil, prog, next)
+			},
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login"}}, nil
 			},
@@ -176,8 +233,10 @@ func TestTSHandlers(t *testing.T) {
 			wantBody:   "Internal Server Error",
 		},
 		{
-			name:    "oidc: user node",
-			handler: oidcFunnel,
+			name: "oidc: user node",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				return oidcFunnel(logger, lc, nil, prog, next)
+			},
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "login", DisplayName: "name"}, Node: &tailcfg.Node{Name: "login.ts.net"}}, nil
 			},
@@ -185,20 +244,85 @@ func TestTSHandlers(t *testing.T) {
 			wantBody:   "Unauthorized",
 		},
 		{
-			name:    "oidc: tagged node",
-			handler: oidcFunnel,
+			name: "oidc: tagged node, no token",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) { return nil, false }, prog, next)
+			},
 			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
 				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
 			},
 			wantStatus: http.StatusUnauthorized,
 			wantBody:   "Unauthorized",
 		},
+		{
+			name: "oidc: tagged node, verified token, expr not set",
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				sub := "sub"
+				exp := time.Now().Add(time.Hour)
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) {
+					return verifiedJWT(t, &jwt.RawJWTOptions{Issuer: &sub, Subject: &sub, ExpiresAt: &exp}), true
+				}, prog, next)
+			},
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantNext:   true,
+		},
+		{
+			name: "oidc: tagged node, verified token, expr set",
+			expr: `{user: oidc.Sub}`,
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				sub := "sub"
+				exp := time.Now().Add(time.Hour)
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) {
+					return verifiedJWT(t, &jwt.RawJWTOptions{Issuer: &sub, Subject: &sub, ExpiresAt: &exp}), true
+				}, prog, next)
+			},
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusOK,
+			wantBody:   "OK",
+			wantNext:   true,
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "sub",
+			},
+		},
+		{
+			name: "oidc: tagged node, verified token, bad expr",
+			expr: `{user: false}`,
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				sub := "sub"
+				exp := time.Now().Add(time.Hour)
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) {
+					return verifiedJWT(t, &jwt.RawJWTOptions{Issuer: &sub, Subject: &sub, ExpiresAt: &exp}), true
+				}, prog, next)
+			},
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
+			var (
+				prog *vm.Program
+				err  error
+			)
+			if tc.expr != "" {
+				prog, err = expr.Compile(tc.expr, expr.AsKind(reflect.Map))
+				if err != nil {
+					t.Fatalf("compile expr: %v", err)
+				}
+			}
+
 			var nextReq *http.Request
-			h := tc.handler(logger, &fakeLocalClient{whois: tc.whois}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := tc.handler(logger, &fakeLocalClient{whois: tc.whois}, prog, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				nextReq = r
 				fmt.Fprintf(w, "OK")
 			}))
@@ -219,6 +343,9 @@ func TestTSHandlers(t *testing.T) {
 			}
 			if tc.wantNext && nextReq == nil {
 				t.Fatalf("next handler not called")
+			}
+			if !tc.wantNext && nextReq != nil {
+				t.Fatalf("next handler should not have been called")
 			}
 			for k, want := range tc.wantHeaders {
 				if got := nextReq.Header.Get(k); got != want {
@@ -296,7 +423,7 @@ func TestRedirectHandler(t *testing.T) {
 			}
 
 			if tc.wantNext && nextReq == nil {
-				t.Fatalf("next handler not called")
+				t.Fatalf("next handler was not called")
 			}
 			if !tc.wantNext && nextReq != nil {
 				t.Fatalf("next handler was called")
@@ -429,5 +556,120 @@ func TestMetrics(t *testing.T) {
 	}
 	for _, prob := range lint {
 		t.Errorf("lint: %s: %s", prob.Metric, prob.Text)
+	}
+}
+
+func TestSetAuthHeader(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		expr        string
+		env         exprEnv
+		wantErr     error
+		wantHeaders map[string]string
+	}{
+		{
+			name:    "bad expr",
+			env:     exprEnv{ID: &idClaims{Sub: "sub"}},
+			expr:    "{foo: false}",
+			wantErr: errors.New("did not return map"),
+		},
+		{
+			name: "ok expr",
+			env:  exprEnv{ID: &idClaims{Sub: "sub"}},
+			expr: "{user: oidc.Sub}",
+			wantHeaders: map[string]string{
+				"X-Webauth-User": "sub",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prog, err := expr.Compile(tc.expr, expr.Env(exprEnv{}), expr.AsKind(reflect.Map))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req, err := setAuthHeader(prog, tc.env, httptest.NewRequest("GET", "/", nil))
+			if err != nil {
+				if tc.wantErr == nil || !strings.Contains(err.Error(), tc.wantErr.Error()) {
+					t.Fatalf("got unexpected err: %v (want: %v)", err, tc.wantErr)
+				}
+			} else if tc.wantErr != nil {
+				t.Fatalf("expected err %v, got none", tc.wantErr)
+			}
+			for k, want := range tc.wantHeaders {
+				if got := req.Header.Get(k); got != want {
+					t.Errorf("want header %s = %s, got: %s", k, want, got)
+				}
+			}
+		})
+	}
+}
+
+func verifiedJWT(t *testing.T, rawOpts *jwt.RawJWTOptions) *jwt.VerifiedJWT {
+	t.Helper()
+
+	h, err := keyset.NewHandle(jwt.ES256Template())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pub, err := h.Public()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signer, err := jwt.NewSigner(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := jwt.NewRawJWT(rawOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := signer.SignAndEncode(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verifier, err := jwt.NewVerifier(pub)
+	if err != nil {
+		t.Fatalf("HERE: %v", err)
+	}
+
+	validator, err := jwt.NewValidator(&jwt.ValidatorOpts{
+		ExpectedIssuer:  rawOpts.Issuer,
+		IgnoreAudiences: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verified, err := verifier.VerifyAndDecode(c, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return verified
+}
+
+//go:embed example.json
+var example []byte
+
+func TestExampleConfig(t *testing.T) {
+	inJSON, err := hujson.Standardize(example)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(inJSON))
+	dec.DisallowUnknownFields()
+	var upstreams []upstream
+	if err := dec.Decode(&upstreams); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -17,11 +17,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
 	"syscall"
 
+	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/vm"
 	incus "github.com/lxc/incus/v6/client"
 	"github.com/lxc/incus/v6/shared/api"
 	"github.com/minio/minio-go/v7"
@@ -33,6 +36,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
 	"github.com/tailscale/hujson"
+	"github.com/tink-crypto/tink-go/v2/jwt"
 	"lds.li/oauth2ext/oidc"
 	"lds.li/oauth2ext/oidcmiddleware"
 	"tailscale.com/client/local"
@@ -77,6 +81,7 @@ type upstream struct {
 	Backend    string
 	Prometheus bool
 	Funnel     *funnelConfig
+	Header     string
 }
 
 type funnelConfig struct {
@@ -144,6 +149,17 @@ func tsproxy(ctx context.Context) error {
 	var upstreams []upstream
 	if err := json.Unmarshal(inJSON, &upstreams); err != nil {
 		return fmt.Errorf("decode --upstream file: %w", err)
+	}
+	progs := make([]*vm.Program, len(upstreams))
+	for i, cfg := range upstreams {
+		if cfg.Header == "" {
+			continue
+		}
+		prog, err := expr.Compile(cfg.Header, expr.Env(exprEnv{}), expr.AsKind(reflect.Map))
+		if err != nil {
+			return fmt.Errorf("upstream %s: compile header expr: %w", cfg.Name, err)
+		}
+		progs[i] = prog
 	}
 
 	if *statedir == "" {
@@ -387,7 +403,7 @@ func tsproxy(ctx context.Context) error {
 					return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
 				}
 
-				srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, false, tailnet(log, lc, proxy)))}
+				srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, false, tailnet(log, lc, progs[i], proxy)))}
 				ln, err := ts.Listen("tcp", ":80")
 				if err != nil {
 					return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
@@ -416,7 +432,7 @@ func tsproxy(ctx context.Context) error {
 
 				srv = &http.Server{
 					TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-					Handler:   instrument(redirect(st.Self.DNSName, true, tailnet(log, lc, proxy))),
+					Handler:   instrument(redirect(st.Self.DNSName, true, tailnet(log, lc, progs[i], proxy))),
 				}
 
 				ln, err := ts.Listen("tcp", ":443")
@@ -445,16 +461,16 @@ func tsproxy(ctx context.Context) error {
 					var handler http.Handler
 					switch {
 					case funnel.Insecure:
-						handler = insecureFunnel(log, lc, proxy)
+						handler = insecureFunnel(log, lc, nil, proxy)
 					case funnel.Issuer != "":
 						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
 						wrapper, err := oidcmiddleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
 						if err != nil {
 							return fmt.Errorf("oidc middleware for %s: %w", upstream.Name, err)
 						}
-						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile)
+						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile, oidc.ScopeEmail)
 
-						handler = wrapper.Wrap(oidcFunnel(log, lc, proxy))
+						handler = wrapper.Wrap(oidcFunnel(log, lc, nil, progs[i], proxy))
 					case funnel.User != "":
 						if _, fn, ok := strings.Cut(funnel.Password, "file://"); ok {
 							data, err := os.ReadFile(fn)
@@ -463,7 +479,7 @@ func tsproxy(ctx context.Context) error {
 							}
 							funnel.Password = strings.TrimSpace(string(data))
 						}
-						handler = insecureFunnel(log, lc, basicAuth(log, funnel.User, funnel.Password, proxy))
+						handler = insecureFunnel(log, lc, nil, basicAuth(log, funnel.User, funnel.Password, proxy))
 					default:
 						return fmt.Errorf("upstream %s: must set funnel.insecure or funnel.issuer", upstream.Name)
 					}
@@ -528,7 +544,7 @@ func basicAuth(logger *slog.Logger, user, password string, next http.Handler) ht
 	})
 }
 
-func tailnet(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
+func tailnet(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := tsWhoIs(lc, r)
 		if err != nil {
@@ -537,20 +553,39 @@ func tailnet(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) ht
 			return
 		}
 
-		// Proxy requests from tagged nodes as is.
+		// tagged nodes do not have a user identity; it might be useful to use the
+		// ACL tags instead but so far I've not found a good reason to do this.
 		if whois.Node.IsTagged() {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		req := r.Clone(r.Context())
-		req.Header.Set("X-Webauth-User", whois.UserProfile.LoginName)
-		req.Header.Set("X-Webauth-Name", whois.UserProfile.DisplayName)
-		next.ServeHTTP(w, req)
+		if prog == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		req, err := setAuthHeader(
+			prog,
+			exprEnv{
+				TS: &tsUser{
+					LoginName:     whois.UserProfile.LoginName,
+					DisplayName:   whois.UserProfile.DisplayName,
+					ProfilePicURL: whois.UserProfile.ProfilePicURL,
+				},
+			},
+			r,
+		)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "evaluate header expr", lerr(err))
+		} else {
+			next.ServeHTTP(w, req)
+		}
 	})
 }
 
-func insecureFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
+func insecureFunnel(logger *slog.Logger, lc tailscaleLocalClient, _ *vm.Program, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := tsWhoIs(lc, r)
 		if err != nil {
@@ -568,7 +603,10 @@ func insecureFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Hand
 	})
 }
 
-func oidcFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler) http.Handler {
+func oidcFunnel(logger *slog.Logger, lc tailscaleLocalClient, idClaimsFunc func(context.Context) (*jwt.VerifiedJWT, bool), prog *vm.Program, next http.Handler) http.Handler {
+	if idClaimsFunc == nil {
+		idClaimsFunc = oidcmiddleware.IDClaimsFromContext
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		whois, err := tsWhoIs(lc, r)
 		if err != nil {
@@ -582,30 +620,38 @@ func oidcFunnel(logger *slog.Logger, lc tailscaleLocalClient, next http.Handler)
 			return
 		}
 
-		tok, ok := oidcmiddleware.IDClaimsFromContext(r.Context())
+		tok, ok := idClaimsFunc(r.Context())
 		if !ok || tok == nil {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
-			logger.ErrorContext(r.Context(), "no verified oidc token found")
-			return
-		}
-		email, err := tok.StringClaim("email")
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.ErrorContext(r.Context(), "oidc claim missing", slog.String("claim", "email"))
-			return
-		}
-		name, err := tok.StringClaim("name")
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			logger.ErrorContext(r.Context(), "oidc claim missing", slog.String("claim", "name"))
+			logger.ErrorContext(r.Context(), "no verified ID claims found")
 			return
 		}
 
-		req := r.Clone(r.Context())
-		req.Header.Set("X-Webauth-User", email)
-		req.Header.Set("X-Webauth-Name", name)
+		if prog == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
 
-		next.ServeHTTP(w, req)
+		var claims idClaims
+		data, err := tok.JSONPayload()
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "encode verified ID claims to json", lerr(err))
+			return
+		}
+		if err := json.Unmarshal(data, &claims); err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "decode verified ID claims into idClaims struct", lerr(err))
+			return
+		}
+
+		req, err := setAuthHeader(prog, exprEnv{ID: &claims}, r)
+		if err != nil {
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			logger.ErrorContext(r.Context(), "evaluate header expr", lerr(err))
+		} else {
+			next.ServeHTTP(w, req)
+		}
 	})
 }
 
@@ -717,4 +763,62 @@ func (s *incusStore) WriteState(id ipn.StateKey, bs []byte) error {
 		return fmt.Errorf("incus: put object %s in bucket %s: %w", s.object, s.bucket, err)
 	}
 	return nil
+}
+
+// exprEnv defines the variables available to the header expr when it is evaluated.
+// One of TS or ID will be non-nil depending on whether the request is coming from
+// the tailnet network or a OIDC funnel.
+type exprEnv struct {
+	TS *tsUser   `expr:"tailscale"`
+	ID *idClaims `expr:"oidc"`
+}
+
+// tsUser is a subset of tailcfg.UserProfile.
+type tsUser struct {
+	LoginName     string
+	DisplayName   string
+	ProfilePicURL string
+}
+
+// idClaims is the set of OIDC claims that are exposed to the header expr.
+type idClaims struct {
+	Sub               string
+	Name              string
+	PreferredUsername string
+	Picture           string
+	Email             string
+}
+
+func setAuthHeader(prog *vm.Program, env exprEnv, req *http.Request) (*http.Request, error) {
+	if prog == nil {
+		panic("prog must not be nil")
+	}
+	if req == nil {
+		panic("req must not be nil")
+	}
+	if (env.TS == nil && env.ID == nil) || (env.TS != nil && env.ID != nil) {
+		panic("one of env.TS or env.ID must be non-nil, but not both")
+	}
+
+	out, err := expr.Run(prog, env)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate expr: %w", err)
+	}
+
+	outMap, ok := out.(map[string]any)
+	if !ok {
+		return nil, errors.New("expr did not return map[string]string")
+	}
+	for _, v := range outMap {
+		_, ok := v.(string)
+		if !ok {
+			return nil, errors.New("expr did not return map[string]string")
+		}
+	}
+
+	newReq := req.Clone(req.Context())
+	for k, v := range outMap {
+		newReq.Header.Set("x-webauth-"+k, v.(string))
+	}
+	return newReq, nil
 }

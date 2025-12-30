@@ -1,21 +1,30 @@
 [
-  {"name": "example", "backend": "http://127.0.0.1:8000"},
-  {"name": "example-socket", "backend": "unix:///tmp/server.sock"},
   {
-    "name": "example-basic",
+    // Hostname of the tsnet server; will be accessible at http://example and
+    // https://example.<tailnet-dns>.ts.net
+    "Name": "example",
+
+    // Backend to proxy to; can also be a path to a UNIX socket,
+    // e.g. unix:///run/myapp.sock
     "backend": "http://127.0.0.1:8000",
+
+    // Expression that evaluates to a map of headers to add to requests.
+    // Keys are prefixed with X-WEBAUTH-<KEY>.
+    // This is optional, by default no additional header is set.
+    // See https://expr-lang.org/ and the exprEnv struct for details.
+    "header": "{user: tailscale?.LoginName ?? oidc.Sub}",
+
+    // Optional funnel configuration. See https://tailscale.com/kb/1223/funnel
     "funnel": {
-      "user": "admin",
-      "password": "password",
-    },
-  },
-  {
-    "name": "example-oidc",
-    "backend": "http://127.0.0.1:8000",
-    "funnel": {
-      "issuer": "http://id-staging.aux1.dev",
+      // Setting the issuer enables OIDC auth.
+      // The redirect URL must be set to https://<fqdn>/.oidc-callback
+      "issuer": "http://localhost:8085",
       "clientID": "client-id",
       "clientSecret": "client-secret",
+
+      // This enables HTTP Basic Auth:
+      "user": "admin",
+      "password": "secret",
     },
   },
 ]
