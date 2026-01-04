@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
@@ -82,6 +83,7 @@ type upstream struct {
 	Prometheus bool
 	Funnel     *funnelConfig
 	Header     string
+	TCP        *tcpConfig
 }
 
 type funnelConfig struct {
@@ -91,6 +93,11 @@ type funnelConfig struct {
 	ClientSecret string
 	User         string
 	Password     string
+}
+
+type tcpConfig struct {
+	Port   int
+	Target string
 }
 
 type target struct {
@@ -382,6 +389,33 @@ func tsproxy(ctx context.Context) error {
 			return fmt.Errorf("upstream %s: cannot proxy to backend: %s", upstream.Name, backendURL)
 		}
 
+		var raddr net.Addr
+		if cfg := upstream.TCP; cfg != nil {
+			if slices.Contains([]int{0, 80, 443}, cfg.Port) {
+				return fmt.Errorf("upstream %s: cannot proxy TCP port %d", upstream.Name, cfg.Port)
+			}
+
+			target, err := url.Parse(cfg.Target)
+			if err != nil {
+				return fmt.Errorf("upstream %s: parse target URL: %w", upstream.Name, err)
+			}
+			switch target.Scheme {
+			case "tcp":
+				raddr, err = net.ResolveTCPAddr("tcp", target.Host)
+				if err != nil {
+					return fmt.Errorf("upstream %s: resolve tcp target: %w", upstream.Name, err)
+				}
+			case "unix":
+				raddr, err = net.ResolveUnixAddr("unix", target.Path)
+				if err != nil {
+					return fmt.Errorf("upstream %s: resolve unix target: %w", upstream.Name, err)
+				}
+			default:
+				return fmt.Errorf("upstream %s: cannot proxy to target: %s", upstream.Name, target)
+			}
+
+		}
+
 		instrument := func(h http.Handler) http.Handler {
 			return promhttp.InstrumentHandlerInFlight(
 				requestsInFlight.With(prometheus.Labels{"upstream": upstream.Name}),
@@ -448,6 +482,58 @@ func tsproxy(ctx context.Context) error {
 				}
 				cancel()
 			})
+		}
+		if cfg := upstream.TCP; cfg != nil {
+			{
+				var ln net.Listener
+				g.Add(func() error {
+					_, err := ts.Up(ctx)
+					if err != nil {
+						return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
+					}
+
+					ln, err = ts.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
+					if err != nil {
+						return fmt.Errorf("tailscale: listen for %s on port %d: %w", upstream.Name, cfg.Port, err)
+					}
+
+					for {
+						src, err := ln.Accept()
+						if err != nil {
+							return fmt.Errorf("upstream %s: accept connection: %w", upstream.Name, err)
+						}
+
+						go func() {
+							var d net.Dialer
+							ctx, cancel := context.WithTimeout(ctx, tcpProxyDialTimeout)
+							defer cancel()
+
+							dst, err := d.DialContext(ctx, raddr.Network(), raddr.String())
+							if err != nil {
+								log.Error("dial target address", slog.String("addr", raddr.String()), lerr(err))
+								src.Close()
+								return
+							}
+							defer dst.Close()
+							defer src.Close()
+
+							errC := make(chan error, 2)
+
+							go proxyCopy(errC, src, dst)
+							go proxyCopy(errC, dst, src)
+
+							<-errC
+							<-errC
+						}()
+					}
+				}, func(_ error) {
+					if ln != nil {
+						if err := ln.Close(); err != nil {
+							log.Error("server shutdown", lerr(err))
+						}
+					}
+				})
+			}
 		}
 		if funnel := upstream.Funnel; funnel != nil {
 			{
@@ -821,4 +907,27 @@ func setAuthHeader(prog *vm.Program, env exprEnv, req *http.Request) (*http.Requ
 		newReq.Header.Set("x-webauth-"+k, v.(string))
 	}
 	return newReq, nil
+}
+
+const tcpProxyDialTimeout = time.Minute
+
+type (
+	closeReader interface{ CloseRead() error }
+	closeWriter interface{ CloseWrite() error }
+)
+
+func proxyCopy(errC chan<- error, src, dst net.Conn) {
+	defer func() {
+		if c, ok := src.(closeReader); ok {
+			_ = c.CloseRead()
+		}
+	}()
+	defer func() {
+		if c, ok := src.(closeWriter); ok {
+			_ = c.CloseWrite()
+		}
+	}()
+
+	_, err := io.Copy(src, dst)
+	errC <- err
 }

@@ -4,7 +4,7 @@
     // https://example.<tailnet-dns>.ts.net
     "Name": "example",
 
-    // Backend to proxy to; can also be a path to a UNIX socket,
+    // HTTP backend to proxy to; can also be a path to a UNIX socket,
     // e.g. unix:///run/myapp.sock
     "backend": "http://127.0.0.1:8000",
 
@@ -26,5 +26,12 @@
       "user": "admin",
       "password": "secret",
     },
+
+    // Optional TCP port to expose, in addition to port 80 and 443.
+    "tcp": {
+      "port": 29418,
+      "target": "tcp://127.0.0.1:29418", // unix:// is supported
+    },
+
   },
 ]
