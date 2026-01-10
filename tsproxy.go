@@ -549,6 +549,13 @@ func tsproxy(ctx context.Context) error {
 					case funnel.Insecure:
 						handler = insecureFunnel(log, lc, nil, proxy)
 					case funnel.Issuer != "":
+						if _, fn, ok := strings.Cut(funnel.ClientSecret, "file://"); ok {
+							data, err := os.ReadFile(fn)
+							if err != nil {
+								return fmt.Errorf("upstream %s: read client secret file: %w", upstream.Name, err)
+							}
+							funnel.ClientSecret = strings.TrimSpace(string(data))
+						}
 						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
 						wrapper, err := oidcmiddleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
 						if err != nil {
@@ -561,7 +568,7 @@ func tsproxy(ctx context.Context) error {
 						if _, fn, ok := strings.Cut(funnel.Password, "file://"); ok {
 							data, err := os.ReadFile(fn)
 							if err != nil {
-								return fmt.Errorf("upstream %s: read password file %s: %w", upstream.Name, fn, err)
+								return fmt.Errorf("upstream %s: read password file: %w", upstream.Name, err)
 							}
 							funnel.Password = strings.TrimSpace(string(data))
 						}
