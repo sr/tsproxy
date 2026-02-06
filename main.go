@@ -28,7 +28,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"lds.li/oauth2ext/oidcmiddleware"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store"
@@ -416,14 +415,19 @@ func newReverseProxy(logger *slog.Logger, lc tailscaleLocalClient, url *url.URL,
 		)
 
 		if isFunnel {
-			idt, ok := oidcmiddleware.IDClaimsFromContext(r.Context())
+			idt, ok := claimsFromContext(r.Context())
 			// only if present, i.e for non-public paths.
 			if ok {
-				email, eok := idt.Extra["email"].(string)
-				name, nok := idt.Extra["name"].(string)
-				if !eok || !nok {
+				email, err := idt.Email()
+				if err != nil {
 					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-					logger.Error("oidc id token missing name and email")
+					logger.Error("oidc id token missing email", lerr(err))
+					return
+				}
+				name, err := idt.Name()
+				if err != nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					logger.Error("oidc id token missing name", lerr(err))
 					return
 				}
 				loginName = email

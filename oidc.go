@@ -7,31 +7,26 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
-	"golang.org/x/oauth2"
-	"lds.li/oauth2ext/oidc"
+	"lds.li/oauth2ext/claims"
+	"lds.li/oauth2ext/middleware"
 	"lds.li/oauth2ext/oidcclientreg"
-	"lds.li/oauth2ext/oidcmiddleware"
+	"lds.li/oauth2ext/provider"
 	"tailscale.com/ipn/ipnstate"
 )
 
-type groupClaims struct {
-	Groups []string `json:"groups"`
-}
+const middlewareRefreshInterval = 24 * time.Hour
 
 func buildMiddlewareForUpstream(ctx context.Context, st *ipnstate.Status, upstream upstream) (func(http.Handler) http.Handler, error) {
-	baseURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".")
+	redirectURL := "https://" + strings.TrimSuffix(st.Self.DNSName, ".") + "/.tsproxy/oidc-callback"
 
-	p, err := oidc.DiscoverProvider(ctx, upstream.OIDCIssuer)
-	if err != nil {
-		return nil, fmt.Errorf("oidc: discover: %w", err)
-	}
-
-	oidcOAuth2ConfigFn, err := oidcOAuth2ConfigFn(ctx, upstream, baseURL+"/.tsproxy/oidc-callback")
-	if err != nil {
-		return nil, fmt.Errorf("oidc: oauth2 config: %w", err)
-	}
+	var (
+		lastRefreshed time.Time
+		currentMw     func(http.Handler) http.Handler
+		refreshMu     sync.RWMutex
+	)
 
 	gmw := func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,23 +35,32 @@ func buildMiddlewareForUpstream(ctx context.Context, st *ipnstate.Status, upstre
 				return
 			}
 
-			cl, ok := oidcmiddleware.IDClaimsFromContext(r.Context())
+			cl, ok := claimsFromContext(r.Context())
 			if !ok {
 				slog.Error("oidc: missing id claims")
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
 			}
 
-			var gc groupClaims
-			if err := cl.UnmarshalClaims(&gc); err != nil {
-				slog.Error("oidc: unmarshalling group claims", "error", err)
+			groups, err := cl.ArrayClaim("groups")
+			if err != nil {
+				slog.Error("oidc: getting groups claim", "error", err)
 				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				return
+			}
+			if groups == nil {
+				slog.Error("oidc: missing groups claim")
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+			strGroups := []string{}
+			for _, group := range groups {
+				strGroups = append(strGroups, group.(string))
 			}
 
 			allowed := false
 			for _, required := range upstream.OIDCRequireGroups {
-				if slices.Contains(gc.Groups, required) {
+				if slices.Contains(strGroups, required) {
 					allowed = true
 					break
 				}
@@ -66,98 +70,110 @@ func buildMiddlewareForUpstream(ctx context.Context, st *ipnstate.Status, upstre
 				return
 			}
 
-			slog.WarnContext(r.Context(), "oidc: user not in required groups", "upstream", upstream.Name, "groups", gc.Groups)
+			slog.WarnContext(r.Context(), "oidc: user not in required groups", "upstream", upstream.Name, "groups", strGroups)
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 		})
 	}
 
-	omw := &oidcmiddleware.Handler{
-		Provider:           p,
-		OAuth2ConfigSource: oidcOAuth2ConfigFn,
-		SessionStore:       &oidcmiddleware.Cookiestore{},
+	refreshMw := func() error {
+		refreshMu.Lock()
+		defer refreshMu.Unlock()
+		if time.Since(lastRefreshed) < middlewareRefreshInterval {
+			return nil
+		}
+		clientID, clientSecret, err := oidcClientCredentials(ctx, upstream, redirectURL)
+		if err != nil {
+			return err
+		}
+		omw, err := middleware.NewIDSSOHandlerFromDiscovery(ctx, nil, upstream.OIDCIssuer, clientID, clientSecret, redirectURL)
+		if err != nil {
+			return fmt.Errorf("oidc: from discovery: %w", err)
+		}
+		if len(upstream.OIDCRequireGroups) > 0 {
+			omw.OAuth2Config.Scopes = append(omw.OAuth2Config.Scopes, "groups")
+		}
+
+		lastRefreshed = time.Now()
+		currentMw = func(h http.Handler) http.Handler {
+			return omw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				cl, ok := omw.IDClaimsFromContext(r.Context())
+				if !ok {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				r = r.WithContext(contextWithClaims(r.Context(), cl))
+				gmw(h).ServeHTTP(w, r)
+			}))
+		}
+
+		return nil
 	}
 
-	return func(h http.Handler) http.Handler {
-		return omw.Wrap(gmw(h))
-	}, nil
-}
-
-func oidcOAuth2ConfigFn(ctx context.Context, upstream upstream, redirURL string) (func(context.Context) (oauth2.Config, error), error) {
-	p, err := oidc.DiscoverProvider(ctx, upstream.OIDCIssuer)
-	if err != nil {
-		return nil, fmt.Errorf("oidc: discover: %w", err)
+	// Prime middleware so we never serve with nil currentMw.
+	if err := refreshMw(); err != nil {
+		return nil, fmt.Errorf("oidc: initial middleware refresh: %w", err)
 	}
 
-	scopes := []string{oidc.ScopeOpenID, oidc.ScopeProfile, oidc.ScopeEmail}
-	if len(upstream.OIDCRequireGroups) > 0 {
-		scopes = append(scopes, "groups")
-	}
-
-	o2cfg := &oauth2.Config{
-		Endpoint:    p.Endpoint(),
-		Scopes:      scopes,
-		RedirectURL: redirURL,
-	}
-
-	if !upstream.OIDCRegisterClient {
-		// just return something that uses the current config.
-		return func(ctx context.Context) (oauth2.Config, error) {
-			c := *o2cfg
-			c.ClientID = upstream.OIDCClientID
-			c.ClientSecret = upstream.OIDCClientSecret
-			return c, nil
-		}, nil
-	}
-
-	// otherwise register a client, and run a routine to update the config.
-	regResp, err := registerOIDCClient(ctx, upstream, p, []string{redirURL})
-	if err != nil {
-		return nil, fmt.Errorf("oidc: register client: %w", err)
-	}
-
-	o2cfg.ClientID = regResp.ClientID
-	o2cfg.ClientSecret = regResp.ClientSecret
-
-	slog.Info("oidc: registered client", "upstream", upstream.Name, "client_id", o2cfg.ClientID)
-
-	reRegisterDelay := time.Hour // for now, to exercise it.
-	// if regResp.ClientSecretExpiresAt != nil {
-	// 	ttl := time.Duration(*regResp.ClientSecretExpiresAt-time.Now().Unix()) * time.Second
-	// 	reRegisterDelay = time.Duration(float64(ttl) * 0.75)
-	// } else {
-	// 	reRegisterDelay = time.Hour // TODO set a better default
-	// }
-
+	// Refresh middleware periodically (provider discovery, registration if used, then new handler).
 	go func() {
+		ticker := time.NewTicker(middlewareRefreshInterval)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(reRegisterDelay):
-				newRegResp, err := registerOIDCClient(ctx, upstream, p, []string{redirURL})
-				if err != nil {
-					slog.Error("oidc: failed to register client", "upstream", upstream.Name, "error", err)
-					// If registration fails, try again sooner
-					reRegisterDelay = time.Minute
-					continue
+			case <-ticker.C:
+				if err := refreshMw(); err != nil {
+					slog.Error("oidc: background middleware refresh failed", "upstream", upstream.Name, "error", err)
 				}
-				slog.Info("oidc: registered client", "upstream", upstream.Name, "client_id", o2cfg.ClientID)
-				o2cfg.ClientID = newRegResp.ClientID
-				o2cfg.ClientSecret = newRegResp.ClientSecret
-				// On success, wait longer before next registration
-				// TODO - same calculation as above
-				reRegisterDelay = time.Hour
 			}
 		}
 	}()
 
-	return func(ctx context.Context) (oauth2.Config, error) {
-		return *o2cfg, nil
+	return func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			refreshMu.RLock()
+			mw := currentMw
+			refreshMu.RUnlock()
+			if mw == nil {
+				// Fallback: e.g. initial refresh failed after we started serving.
+				if err := refreshMw(); err != nil {
+					slog.Error("oidc: failed to refresh middleware", "error", err)
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+				refreshMu.RLock()
+				mw = currentMw
+				refreshMu.RUnlock()
+				if mw == nil {
+					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+					return
+				}
+			}
+			mw(h).ServeHTTP(w, r)
+		})
 	}, nil
 }
 
+// oidcClientCredentials returns client ID and secret for the upstream (static config or dynamic registration).
+func oidcClientCredentials(ctx context.Context, upstream upstream, redirectURL string) (clientID, clientSecret string, err error) {
+	if !upstream.OIDCRegisterClient {
+		return upstream.OIDCClientID, upstream.OIDCClientSecret, nil
+	}
+	p, err := provider.DiscoverOIDCProvider(ctx, upstream.OIDCIssuer)
+	if err != nil {
+		return "", "", fmt.Errorf("oidc: discover: %w", err)
+	}
+	regResp, err := registerOIDCClient(ctx, upstream, p, []string{redirectURL})
+	if err != nil {
+		return "", "", fmt.Errorf("oidc: register client: %w", err)
+	}
+	slog.Info("oidc: registered client", "upstream", upstream.Name, "client_id", regResp.ClientID)
+	return regResp.ClientID, regResp.ClientSecret, nil
+}
+
 // registerOIDCClient performs dynamic client registration with the OIDC provider
-func registerOIDCClient(ctx context.Context, upstream upstream, provider *oidc.Provider, redirectURIs []string) (*oidcclientreg.ClientRegistrationResponse, error) {
+func registerOIDCClient(ctx context.Context, upstream upstream, prov *provider.Provider, redirectURIs []string) (*oidcclientreg.ClientRegistrationResponse, error) {
 	// Create registration request
 	request := &oidcclientreg.ClientRegistrationRequest{
 		ClientName:      fmt.Sprintf("tsproxy-%s", upstream.Name),
@@ -167,14 +183,33 @@ func registerOIDCClient(ctx context.Context, upstream upstream, provider *oidc.P
 		GrantTypes:      []string{"authorization_code"},
 	}
 
-	if slices.Contains(provider.Metadata.IDTokenSigningAlgValuesSupported, "ES256") {
+	oidcMetadata, ok := prov.Metadata.(*provider.OIDCProviderMetadata)
+	if !ok {
+		return nil, fmt.Errorf("provider metadata is not an OIDC provider metadata")
+	}
+
+	if slices.Contains(oidcMetadata.IDTokenSigningAlgValuesSupported, "ES256") {
 		request.IDTokenSignedResponseAlg = "ES256"
 	}
 
-	response, err := oidcclientreg.RegisterWithProvider(ctx, provider, request)
+	response, err := oidcclientreg.RegisterWithProvider(ctx, prov, request)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register client: %w", err)
 	}
 
 	return response, nil
+}
+
+type claimsKey struct{}
+
+func contextWithClaims(ctx context.Context, cl *claims.VerifiedID) context.Context {
+	return context.WithValue(ctx, claimsKey{}, cl)
+}
+
+func claimsFromContext(ctx context.Context) (*claims.VerifiedID, bool) {
+	cl, ok := ctx.Value(claimsKey{}).(*claims.VerifiedID)
+	if !ok {
+		return nil, false
+	}
+	return cl, true
 }
