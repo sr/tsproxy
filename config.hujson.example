@@ -1,0 +1,22 @@
+{
+  "logTailscale": true,
+  "kubernetes": {
+    "enabled": true,
+    "kubeconfig": "${HOME}/.kube/config",
+    "namespace": "default",
+    "secret": "tsproxy",
+  },
+  "upstreams": [
+    {
+      "name": "tsproxydev",
+      "backend": "http://localhost:8080",
+      "funnel": true,
+      "funnelPublicPatterns": [
+        "/testPublic",
+      ],
+      "oidcIssuer": "https://oidc-issuer",
+      "oidcClientID": "tsproxydev",
+      "oidcClientSecret": "XXXX",
+    },
+  ],
+}
