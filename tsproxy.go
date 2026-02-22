@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -351,7 +352,6 @@ func tsproxy(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("upstream %s: parse backend URL: %w", upstream.Name, err)
 		}
-		// TODO(sr) Instrument proxy.Transport
 		proxy := &httputil.ReverseProxy{
 			Rewrite: func(req *httputil.ProxyRequest) {
 				if backendURL.Scheme == "unix" {
@@ -441,7 +441,7 @@ func tsproxy(ctx context.Context) error {
 					return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
 				}
 
-				srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, false, tailnet(log, lc, progs[i], proxy)))}
+				srv = &http.Server{Handler: instrument(redirect(st.Self.DNSName, false, stripAuthHeaders(tailnet(log, lc, progs[i], proxy))))}
 				ln, err := ts.Listen("tcp", ":80")
 				if err != nil {
 					return fmt.Errorf("tailscale: listen for %s on port 80: %w", upstream.Name, err)
@@ -470,7 +470,7 @@ func tsproxy(ctx context.Context) error {
 
 				srv = &http.Server{
 					TLSConfig: &tls.Config{GetCertificate: lc.GetCertificate},
-					Handler:   instrument(redirect(st.Self.DNSName, true, tailnet(log, lc, progs[i], proxy))),
+					Handler:   instrument(redirect(st.Self.DNSName, true, stripAuthHeaders(tailnet(log, lc, progs[i], proxy)))),
 				}
 
 				ln, err := ts.Listen("tcp", ":443")
@@ -486,6 +486,69 @@ func tsproxy(ctx context.Context) error {
 				}
 				cancel()
 			})
+		}
+		if funnel := upstream.Funnel; funnel != nil {
+			{
+				var srv *http.Server
+				g.Add(func() error {
+					st, err := ts.Up(ctx)
+					if err != nil {
+						return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
+					}
+
+					var handler http.Handler
+					switch {
+					case funnel.Insecure:
+						handler = insecureFunnel(log, lc, nil, proxy)
+					case funnel.Issuer != "":
+						if _, fn, ok := strings.Cut(funnel.ClientSecret, "file://"); ok {
+							data, err := os.ReadFile(fn)
+							if err != nil {
+								return fmt.Errorf("upstream %s: read client secret file: %w", upstream.Name, err)
+							}
+							funnel.ClientSecret = strings.TrimSpace(string(data))
+						}
+						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
+						wrapper, err := oidcmiddleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
+						if err != nil {
+							return fmt.Errorf("oidc middleware for %s: %w", upstream.Name, err)
+						}
+						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile, oidc.ScopeEmail)
+
+						handler = wrapper.Wrap(oidcFunnel(log, lc, nil, progs[i], proxy))
+					case funnel.User != "":
+						if _, fn, ok := strings.Cut(funnel.Password, "file://"); ok {
+							data, err := os.ReadFile(fn)
+							if err != nil {
+								return fmt.Errorf("upstream %s: read password file: %w", upstream.Name, err)
+							}
+							funnel.Password = strings.TrimSpace(string(data))
+						}
+						handler = insecureFunnel(log, lc, nil, basicAuth(log, funnel.User, funnel.Password, proxy))
+					default:
+						return fmt.Errorf("upstream %s: must set funnel.insecure or funnel.issuer", upstream.Name)
+					}
+					srv = &http.Server{
+						Handler: instrument(redirect(st.Self.DNSName, true, stripAuthHeaders(handler))),
+						ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+							return context.WithValue(ctx, ctxConn{}, c)
+						},
+					}
+
+					ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
+					if err != nil {
+						return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
+					}
+					return srv.Serve(ln)
+				}, func(_ error) {
+					if srv != nil {
+						if err := srv.Close(); err != nil {
+							log.Error("server shutdown", lerr(err))
+						}
+					}
+					cancel()
+				})
+			}
 		}
 		if cfg := upstream.TCP; cfg != nil {
 			{
@@ -536,69 +599,6 @@ func tsproxy(ctx context.Context) error {
 							log.Error("server shutdown", lerr(err))
 						}
 					}
-				})
-			}
-		}
-		if funnel := upstream.Funnel; funnel != nil {
-			{
-				var srv *http.Server
-				g.Add(func() error {
-					st, err := ts.Up(ctx)
-					if err != nil {
-						return fmt.Errorf("tailscale: wait for tsnet %s to be ready: %w", upstream.Name, err)
-					}
-
-					var handler http.Handler
-					switch {
-					case funnel.Insecure:
-						handler = insecureFunnel(log, lc, nil, proxy)
-					case funnel.Issuer != "":
-						if _, fn, ok := strings.Cut(funnel.ClientSecret, "file://"); ok {
-							data, err := os.ReadFile(fn)
-							if err != nil {
-								return fmt.Errorf("upstream %s: read client secret file: %w", upstream.Name, err)
-							}
-							funnel.ClientSecret = strings.TrimSpace(string(data))
-						}
-						redir := &url.URL{Scheme: "https", Host: strings.TrimSuffix(st.Self.DNSName, "."), Path: ".oidc-callback"}
-						wrapper, err := oidcmiddleware.NewFromDiscovery(ctx, nil, funnel.Issuer, funnel.ClientID, funnel.ClientSecret, redir.String())
-						if err != nil {
-							return fmt.Errorf("oidc middleware for %s: %w", upstream.Name, err)
-						}
-						wrapper.OAuth2Config.Scopes = append(wrapper.OAuth2Config.Scopes, oidc.ScopeProfile, oidc.ScopeEmail)
-
-						handler = wrapper.Wrap(oidcFunnel(log, lc, nil, progs[i], proxy))
-					case funnel.User != "":
-						if _, fn, ok := strings.Cut(funnel.Password, "file://"); ok {
-							data, err := os.ReadFile(fn)
-							if err != nil {
-								return fmt.Errorf("upstream %s: read password file: %w", upstream.Name, err)
-							}
-							funnel.Password = strings.TrimSpace(string(data))
-						}
-						handler = insecureFunnel(log, lc, nil, basicAuth(log, funnel.User, funnel.Password, proxy))
-					default:
-						return fmt.Errorf("upstream %s: must set funnel.insecure or funnel.issuer", upstream.Name)
-					}
-					srv = &http.Server{
-						Handler: instrument(redirect(st.Self.DNSName, true, handler)),
-						ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-							return context.WithValue(ctx, ctxConn{}, c)
-						},
-					}
-
-					ln, err := ts.ListenFunnel("tcp", ":443", tsnet.FunnelOnly())
-					if err != nil {
-						return fmt.Errorf("tailscale: funnel for %s on port 443: %w", upstream.Name, err)
-					}
-					return srv.Serve(ln)
-				}, func(_ error) {
-					if srv != nil {
-						if err := srv.Close(); err != nil {
-							log.Error("server shutdown", lerr(err))
-						}
-					}
-					cancel()
 				})
 			}
 		}
@@ -889,6 +889,18 @@ type idClaims struct {
 	PreferredUsername string `json:"preferred_username"`
 	Picture           string `json:"picture"`
 	Email             string `json:"email"`
+}
+
+func stripAuthHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := r.Clone(r.Context())
+		for k := range req.Header {
+			if strings.HasPrefix(k, textproto.CanonicalMIMEHeaderKey("X-WEBAUTH")) {
+				req.Header.Del(k)
+			}
+		}
+		next.ServeHTTP(w, req)
+	})
 }
 
 func setAuthHeader(prog *vm.Program, env exprEnv, req *http.Request) (*http.Request, error) {

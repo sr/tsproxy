@@ -540,6 +540,25 @@ func TestBasicAuthHandler(t *testing.T) {
 	}
 }
 
+func TestStripAuthHeadersHandler(t *testing.T) {
+	t.Parallel()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("", "/", nil)
+	req.Header.Add("x-webauth-user", "user")
+	req.Header.Add("x-webauth-magic", "value")
+
+	stripAuthHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-WEBAUTH-USER") != "" {
+			t.Fatalf("X-WEBAUTH header still present")
+		}
+		if r.Header.Get("X-WEBAUTH-MAGIC") != "" {
+			t.Fatalf("X-WEBAUTH header still present")
+		}
+		fmt.Fprintf(w, "OK")
+	})).ServeHTTP(w, req)
+}
+
 func TestServeDiscovery(t *testing.T) {
 	t.Parallel()
 
