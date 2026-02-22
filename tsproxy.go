@@ -875,11 +875,11 @@ type tsUser struct {
 
 // idClaims is the set of OIDC claims that are exposed to the header expr.
 type idClaims struct {
-	Sub               string
-	Name              string
-	PreferredUsername string
-	Picture           string
-	Email             string
+	Sub               string `json:"sub"`
+	Name              string `json:"name"`
+	PreferredUsername string `json:"preferred_username"`
+	Picture           string `json:"picture"`
+	Email             string `json:"email"`
 }
 
 func setAuthHeader(prog *vm.Program, env exprEnv, req *http.Request) (*http.Request, error) {
@@ -902,10 +902,16 @@ func setAuthHeader(prog *vm.Program, env exprEnv, req *http.Request) (*http.Requ
 	if !ok {
 		return nil, errors.New("expr did not return map[string]string")
 	}
-	for _, v := range outMap {
-		_, ok := v.(string)
+	for k, v := range outMap {
+		if k == "" {
+			return nil, errors.New("map key must not be the empty string")
+		}
+		s, ok := v.(string)
 		if !ok {
 			return nil, errors.New("expr did not return map[string]string")
+		}
+		if s == "" {
+			return nil, fmt.Errorf("map value for key %s must not be the empty string", k)
 		}
 	}
 

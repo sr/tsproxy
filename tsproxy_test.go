@@ -306,6 +306,38 @@ func TestTSHandlers(t *testing.T) {
 			wantStatus: http.StatusInternalServerError,
 			wantBody:   "Internal Server Error",
 		},
+		{
+			name: "oidc: tagged node, verified token, empty string map key",
+			expr: `{"": "val"}`,
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				sub := "sub"
+				exp := time.Now().Add(time.Hour)
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) {
+					return verifiedJWT(t, &jwt.RawJWTOptions{Issuer: &sub, Subject: &sub, ExpiresAt: &exp}), true
+				}, prog, next)
+			},
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
+		{
+			name: "oidc: tagged node, verified token, empty string map value",
+			expr: `{user: ""}`,
+			handler: func(logger *slog.Logger, lc tailscaleLocalClient, prog *vm.Program, next http.Handler) http.Handler {
+				sub := "sub"
+				exp := time.Now().Add(time.Hour)
+				return oidcFunnel(logger, lc, func(_ context.Context) (*jwt.VerifiedJWT, bool) {
+					return verifiedJWT(t, &jwt.RawJWTOptions{Issuer: &sub, Subject: &sub, ExpiresAt: &exp}), true
+				}, prog, next)
+			},
+			whois: func(_ context.Context, _ string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{UserProfile: &tailcfg.UserProfile{LoginName: "tagged-devices"}, Node: &tailcfg.Node{Tags: []string{"tag:ingress"}}}, nil
+			},
+			wantStatus: http.StatusInternalServerError,
+			wantBody:   "Internal Server Error",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
