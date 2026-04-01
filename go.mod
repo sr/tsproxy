@@ -1,4 +1,4 @@
-module github.com/sr/tsproxy
+module aux1.dev/tsproxy
 
 go 1.25.5
 
